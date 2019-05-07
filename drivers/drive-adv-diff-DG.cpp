@@ -2,6 +2,7 @@
 // Produced at the Lawrence Livermore National Laboratory. Written by
 // Jacob Schroder, Rob Falgout, Tzanio Kolev, Ulrike Yang, Veselin
 // Dobrev, et al. LLNL-CODE-660355. All rights reserved.
+// Modified by Wayne Mitchell to include AIR AMG as the solver for implicit methods.
 //
 // This file is part of XBraid. For support, post issues to the XBraid Github page.
 //
@@ -22,7 +23,7 @@
 //
 // Interface:     C++, through MFEM 
 // 
-// Requires:      MFEM, Hypre, Metis and GlVis
+// Requires:      MFEM (AIR branch), Hypre, Metis and GlVis
 //                Modify Makefile to point to metis, mfem and hypre libraries
 //
 // Compile with:  make drive-adv-diff-DG
@@ -33,6 +34,8 @@
 //
 // Description:   Solves (a) scalar ODE problems, and (b) the 2D/3D heat equation
 
+
+// #define NEW_VERSION
 
 #include "braid_mfem.hpp"
 #include "mfem_arnoldi.hpp"
@@ -46,6 +49,12 @@ using namespace hypre;
 // Choice for the problem setup. The fluid velocity, initial condition and
 // inflow boundary condition are chosen based on this parameter.
 int problem;
+
+#ifdef NEW_VERSION
+// !!! Changed: added variables from Ben's code for the mesh bounding box
+// Mesh bounding box
+Vector bb_min, bb_max;
+#endif
 
 // Velocity coefficient
 void velocity_function(const Vector &x, Vector &v);
@@ -72,16 +81,29 @@ private:
 
    mutable Array<double> dts;
    mutable Array<HypreParMatrix*> B; // B = M - dt*K, for ImplicitSolve
+#ifdef NEW_VERSION
+   // !!! Changed: added B_s
+   mutable Array<HypreParMatrix*> B_s; // Block inverse scaled version of B
+#endif
    mutable Array<Operator*> B_prec;
    mutable Array<Solver*> B_solver;
    int prec_type;
+#ifdef NEW_VERSION
+   // !!! Changed: added blocksize
+   int blocksize;
+#endif
 
    mutable Vector z; // auxiliary vector
 
    int GetDtIndex(double dt) const;
 
 public:
+   // !!! Changed: passing in order as well
+#ifdef NEW_VERSION
+   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, const Vector &_b, int order);
+#else
    FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, const Vector &_b);
+#endif
 
    /** 0 - HypreParaSails, 1 - HypreBoomerAMG, 2 - UMFPackSolver */
    void SetPreconditionerType(int type) { prec_type = type; }
@@ -228,6 +250,10 @@ int main(int argc, char *argv[])
    {
       mesh->SetCurvature(std::max(opts.order, 1));
    }
+#ifdef NEW_VERSION
+   // !!! Changed: getting bounding box info
+   mesh->GetBoundingBox(bb_min, bb_max, max(opts.order, 1));
+#endif
 
    // Split comm (MPI_COMM_WORLD) into spatial and temporal communicators
    MPI_Comm comm_x, comm_t;
@@ -254,8 +280,14 @@ int main(int argc, char *argv[])
 
 
 // Implementation of class FE_Evolution
+// !!! Changed: passing in order as well
+#ifdef NEW_VERSION
+FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K,
+                           const Vector &_b, int order)
+#else
 FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K,
                            const Vector &_b)
+#endif
    : TimeDependentOperator(_M.Height()),
      M(_M), K(_K), b(_b), M_solver(M.GetComm()), z(_M.Height())
 {
@@ -268,6 +300,12 @@ FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K,
    M_solver.SetAbsTol(0.0);
    M_solver.SetMaxIter(100);
    M_solver.SetPrintLevel(0);
+
+   // !!! Changed: added blocksize
+#ifdef NEW_VERSION
+   // DG block size given by (FEorder+1)^2 on square meshes.
+   blocksize = (order+1)*(order+1);
+#endif
 }
 
 FE_Evolution::~FE_Evolution()
@@ -277,6 +315,10 @@ FE_Evolution::~FE_Evolution()
       delete B_solver[i];
       delete B_prec[i];
       delete B[i];
+      // !!! Changed: added B_s
+#ifdef NEW_VERSION
+      delete B_s[i];
+#endif
    }
 }
 
@@ -297,6 +339,53 @@ int FE_Evolution::GetDtIndex(double dt) const
    hypre_ParCSRMatrixSum(B_new, 1.0, M);
    hypre_ParCSRMatrixSum(B_new, -dt, K);
 
+
+
+
+
+   // !!! Changed: replaced the solver setup below with adaptation of Ben's code
+
+#ifdef NEW_VERSION
+   B_s.Append(new HypreParMatrix(B_new));
+   HypreParMatrix &B_s_new = *B_s.Last();
+   BlockInvScal(&B_new, &B_s_new, NULL, NULL, blocksize, 0);
+
+   int print_level = 0;
+   HypreBoomerAMG *AMG_solver = new HypreBoomerAMG(B_s_new);
+   AMG_solver->SetMaxLevels(50);   
+   // !!! Need to figure out how to determine whether to use AIR
+   int use_AIR = 1;
+   if (use_AIR) {
+      AMG_solver->SetLAIROptions(1.5, "", "FFC", 0.1, 0.01, 0.0,
+      100, 3, 0.0, 10, -1, 1);
+      // 100, 3, 0.0, 6, -1, 1);
+   }
+   else {
+      AMG_solver->SetInterpolation(0);
+      AMG_solver->SetCoarsening(6);
+      AMG_solver->SetAggressiveCoarsening(1);
+   }
+
+   // !!! Any reason not to use GMRES?
+   int use_gmres = 1;
+   if (use_gmres) {
+      HypreGMRES *GMRES_solver = new HypreGMRES(B_s_new);
+      GMRES_solver->SetTol(1e-12);
+      GMRES_solver->SetMaxIter(100);
+      GMRES_solver->SetPrintLevel(print_level);
+      GMRES_solver->SetPreconditioner(*AMG_solver);
+      GMRES_solver->iterative_mode = false;
+      B_prec.Append(AMG_solver);
+      B_solver.Append(GMRES_solver);
+   }
+   else {
+      AMG_solver->SetPrintLevel(print_level);
+      AMG_solver->SetTol(1e-12);
+      AMG_solver->SetMaxIter(100);
+      B_solver.Append(AMG_solver);
+   }
+
+#else
    HypreSolver *B_hs = NULL;
    Solver *B_prec_new = NULL;
    Solver *B_solver_new = NULL;
@@ -339,6 +428,9 @@ int FE_Evolution::GetDtIndex(double dt) const
       B_solver_new = solver;
    }
    B_solver.Append(B_solver_new);
+#endif
+
+
 
    return dts.Size()-1;
 }
@@ -357,7 +449,16 @@ void FE_Evolution::ImplicitSolve(const double dt, const Vector &x, Vector &k)
    int i = GetDtIndex(dt);
    K.Mult(x, z);
    z += b;
+
+#ifdef NEW_VERSION
+   // !!! Changed: added block inv scaling from Ben's code
+   HypreParVector b_s;
+   BlockInvScal(B[i], NULL, &z, &b_s, blocksize, 2);
+   B_solver[i]->Mult(b_s, k);
+#else
    B_solver[i]->Mult(z, k);
+#endif
+
    if (HYPRE_GetError())
    {
       MFEM_WARNING("HYPRE error = " << HYPRE_GetError());
@@ -385,7 +486,7 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    num_procs_x    = 1;
 
    // set defaults for the (optional) mesh/refinement inherited options
-   mesh_file       = "../../mfem/data/periodic-hexagon.mesh";
+   mesh_file       = "../../../mfem/data/periodic-hexagon.mesh";
    ser_ref_levels  = 2;
    par_ref_levels  = 0;
    AddMeshOptions();
@@ -501,7 +602,6 @@ DGAdvectionApp::~DGAdvectionApp()
       delete M[l];
    }
 }
-
 
 int DGAdvectionApp::Step(braid_Vector    u_,
                          braid_Vector    ustop_,
@@ -667,10 +767,21 @@ void DGAdvectionApp::InitLevel(int l)
    k->AddBdrFaceIntegrator(
       new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
    HypreParMatrix *S = NULL;
+
+   // !!! Changed: moved declaration of sigma and kappa outside and defaulted them to IP method
+#ifdef NEW_VERSION
+   double sigma, kappa;
+   sigma = -1.0;
+   kappa = (options.order+1)*(options.order+1);
+#endif
+
    if (options.diffusion > 0.0)
    {
-      double sigma, kappa;
       ParBilinearForm *s = new ParBilinearForm(fe_space[l]);
+      // !!! Changed: commented out below
+#ifdef NEW_VERSION
+#else
+      double sigma, kappa;
       if (1)
       {
          // IP method
@@ -683,12 +794,17 @@ void DGAdvectionApp::InitLevel(int l)
          sigma = 1.0;
          kappa = 1.0;
       }
+#endif
       // S has coefficient one, we multiply by the "diffusion" coefficient,
       // options.diffusion, later.
       ConstantCoefficient one(1.0);
       s->AddDomainIntegrator(new DiffusionIntegrator(one));
       s->AddInteriorFaceIntegrator(
          new DGDiffusionIntegrator(one, sigma, kappa));
+      // !!! Changed: added DG face integrator
+#ifdef NEW_VERSION
+      s->AddBdrFaceIntegrator(new DGDiffusionIntegrator(one, sigma, kappa));
+#endif
       const int skip_zeros = 0;
       s->Assemble(skip_zeros);
       s->Finalize(skip_zeros);
@@ -721,8 +837,15 @@ void DGAdvectionApp::InitLevel(int l)
    }
 
    ParLinearForm *b = new ParLinearForm(fe_space[l]);
+   // !!! Changed: replaced definition of form b with Ben's
+#ifdef NEW_VERSION
+   ConstantCoefficient diff_coef(options.diffusion);
+   b->AddBdrFaceIntegrator(
+      new DGDirichletLFIntegrator(u0, diff_coef, sigma, kappa)); 
+#else
    b->AddBdrFaceIntegrator(
       new BoundaryFlowIntegrator(inflow, velocity, -1.0, -0.5));
+#endif
 
    m->Assemble();
    m->Finalize();
@@ -757,7 +880,11 @@ void DGAdvectionApp::InitLevel(int l)
    }
 
    // Create the time-dependent operator, ode[l]
+#ifdef NEW_VERSION
+   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], *B[l], options.order);
+#else
    FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], *B[l]);
+#endif
    fe_ev->SetPreconditionerType(options.prec_type);
    ode[l] = fe_ev;
 
@@ -809,6 +936,118 @@ void DGAdvectionApp::PrintStats(MPI_Comm comm)
 }
 
 
+// !!! Changed: replaced the velocity_function and initial condition with Ben's
+#ifdef NEW_VERSION
+// Velocity coefficient
+void velocity_function(const Vector &x, Vector &v)
+{
+   int dim = x.Size();
+
+   // map to the reference [-1,1] domain
+   Vector X(dim);
+   for (int i = 0; i < dim; i++)
+   {
+      double center = (bb_min[i] + bb_max[i]) * 0.5;
+      X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
+   }
+
+   switch (problem)
+   {
+      case 0:
+      {
+         // Translations in 1D, 2D, and 3D
+         switch (dim)
+         {
+            case 1: v(0) = 1.0; break;
+            case 2: v(0) = sqrt(2./3.); v(1) = sqrt(1./3.); break;
+            case 3: v(0) = sqrt(3./6.); v(1) = sqrt(2./6.); v(2) = sqrt(1./6.);
+               break;
+         }
+         break;
+      }
+      case 1:
+      case 2:
+      {
+         // Clockwise rotation in 2D around the origin
+         const double w = M_PI/2;
+         switch (dim)
+         {
+            case 1: v(0) = 1.0; break;
+            case 2: v(0) = w*X(1); v(1) = -w*X(0); break;
+            case 3: v(0) = w*X(1); v(1) = -w*X(0); v(2) = 0.0; break;
+         }
+         break;
+      }
+      case 3:
+      {
+         // Clockwise twisting rotation in 2D around the origin
+         const double w = M_PI/2;
+         double d = max((X(0)+1.)*(1.-X(0)),0.) * max((X(1)+1.)*(1.-X(1)),0.);
+         d = d*d;
+         switch (dim)
+         {
+            case 1: v(0) = 1.0; break;
+            case 2: v(0) = d*w*X(1); v(1) = -d*w*X(0); break;
+            case 3: v(0) = d*w*X(1); v(1) = -d*w*X(0); v(2) = 0.0; break;
+         }
+         break;
+      }
+   }
+}
+
+// Initial condition
+double u0_function(Vector &x)
+{
+   int dim = x.Size();
+
+   // map to the reference [-1,1] domain
+   Vector X(dim);
+   for (int i = 0; i < dim; i++)
+   {
+      double center = (bb_min[i] + bb_max[i]) * 0.5;
+      X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
+   }
+
+   switch (problem)
+   {
+      case 0:
+      case 1:
+      {
+         switch (dim)
+         {
+            case 1:
+               return exp(-40.*pow(X(0)-0.5,2));
+            case 2:
+            case 3:
+            {
+               double rx = 0.45, ry = 0.25, cx = 0., cy = -0.2, w = 10.;
+               if (dim == 3)
+               {
+                  const double s = (1. + 0.25*cos(2*M_PI*X(2)));
+                  rx *= s;
+                  ry *= s;
+               }
+               return ( erfc(w*(X(0)-cx-rx))*erfc(-w*(X(0)-cx+rx)) *
+                        erfc(w*(X(1)-cy-ry))*erfc(-w*(X(1)-cy+ry)) )/16;
+            }
+         }
+      }
+      case 2:
+      {
+         double x_ = X(0), y_ = X(1), rho, phi;
+         rho = hypot(x_, y_);
+         phi = atan2(y_, x_);
+         return pow(sin(M_PI*rho),2)*sin(3*phi);
+      }
+      case 3:
+      {
+         const double f = M_PI;
+         return sin(f*X(0))*sin(f*X(1));
+      }
+   }
+   return 0.0;
+}
+#else
 // Velocity coefficient
 void velocity_function(const Vector &x, Vector &v)
 {
@@ -903,6 +1142,7 @@ double u0_function(Vector &x)
    }
    return 0.0;
 }
+#endif
 
 // Inflow boundary condition (zero for the problems considered in this example)
 double inflow_function(Vector &x)

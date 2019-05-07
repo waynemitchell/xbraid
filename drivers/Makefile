@@ -38,8 +38,11 @@ HYPRE_DIR = ../../hypre/src/hypre
 HYPRE_FLAGS = -I$(HYPRE_DIR)/include
 HYPRE_LIB = -L$(HYPRE_DIR)/lib -lHYPRE
 
+PARMETIS_DIR = ../../parmetis-4.0.3/build/Linux-x86_64
+PARMETIS_LIB = -L$(PARMETIS_DIR)/libparmetis -lparmetis
+
 MFEM_INTERFACE = ./braid_mfem.hpp ./braid_mfem_block.hpp ../braid/braid.hpp
-MFEM_DIR = ../../mfem
+MFEM_DIR = ../../mfem/build
 MFEM_CONFIG_MK = $(MFEM_DIR)/config/config.mk
 MFEM_LIB_FILE = mfem_is_not_built
 -include $(MFEM_CONFIG_MK)
@@ -75,7 +78,7 @@ all: $(C_NOHYPRE) $(C_EXAMPLES) $(CXX_EXAMPLES)
 %: %.cpp $(BRAID_LIB_FILE) $(MFEM_LIB_FILE) $(MFEM_CONFIG_MK) $(MFEM_INTERFACE)
 	@echo "Building" $@ "..."
 	$(MPICXX) $(CXXFLAGS) $(BRAID_FLAGS) $(MFEM_FLAGS) \
- $< -o $@ $(MFEM_LIBS) $(BRAID_LIB_FILE) $(LFLAGS)
+ $< -o $@ $(MFEM_LIBS) $(BRAID_LIB_FILE) $(LFLAGS) $(PARMETIS_LIB)
 
 # Generate an error message if the MFEM library is not built and exit
 $(MFEM_LIB_FILE):

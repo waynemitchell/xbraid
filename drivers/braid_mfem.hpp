@@ -810,12 +810,22 @@ int MFEMBraidApp::Access(braid_Vector       u_,
       {
          sol_sock.open(vishost, visport);
          init_sock = 1;
+
+         // Debug
+         std::cout << "sol sock not open, init_sock = " << init_sock << std::endl;
       }
+
+       // Debug
+       std::cout << "init_sock = " << init_sock << std::endl;
+
 
       int good, all_good;
       good = sol_sock.good();
       MPI_Allreduce(&good, &all_good, 1, MPI_INT, MPI_LAND,
                     mesh[level]->GetComm());
+
+     // Debug
+     std::cout << "all_good = " << all_good << std::endl;
 
       if (all_good)
       {

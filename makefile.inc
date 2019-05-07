@@ -119,7 +119,7 @@ else ifeq ($(findstring vulcan,$(HOSTNAME)),vulcan)
    endif
 else ifeq ($(shell uname -s),Linux)
    MPICC = mpicc
-   MPICXX = mpiCC
+   MPICXX = mpicxx
    MPIF90 = mpif90
    LFLAGS = -lm
    ifeq ($(optlevel),DEBUG)
@@ -136,7 +136,7 @@ else ifeq ($(shell uname -s),Linux)
 ##
 else
    MPICC = mpicc
-   MPICXX = mpiCC
+   MPICXX = mpicxx
    MPIF90 = mpif90
    LFLAGS = -lm
    ifeq ($(optlevel),DEBUG)
