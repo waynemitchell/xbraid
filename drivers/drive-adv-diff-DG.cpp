@@ -34,9 +34,6 @@
 //
 // Description:   Solves (a) scalar ODE problems, and (b) the 2D/3D heat equation
 
-
-// #define NEW_VERSION
-
 #include "braid_mfem.hpp"
 #include "mfem_arnoldi.hpp"
 #include "hypre_extra.hpp"
@@ -49,12 +46,7 @@ using namespace hypre;
 // Choice for the problem setup. The fluid velocity, initial condition and
 // inflow boundary condition are chosen based on this parameter.
 int problem;
-
-#ifdef NEW_VERSION
-// !!! Changed: added variables from Ben's code for the mesh bounding box
-// Mesh bounding box
 Vector bb_min, bb_max;
-#endif
 
 // Velocity coefficient
 void velocity_function(const Vector &x, Vector &v);
@@ -64,65 +56,6 @@ double u0_function(Vector &x);
 
 // Inflow boundary condition
 double inflow_function(Vector &x);
-
-
-/** A time-dependent operator for the right-hand side of the ODE. The DG weak
-    form of du/dt = v.grad(u) is M du/dt = K u + b, where M and K are the mass
-    and advection matrices, and b describes the flow on the boundary. This can
-    be written as a general ODE, du/dt = M^{-1} (K u + b), and this class is
-    used to evaluate the right-hand side. */
-class FE_Evolution : public TimeDependentOperator
-{
-private:
-   HypreParMatrix &M, &K;
-   const Vector &b;
-   HypreSmoother M_prec;
-   CGSolver M_solver;
-
-   mutable Array<double> dts;
-   mutable Array<HypreParMatrix*> B; // B = M - dt*K, for ImplicitSolve
-#ifdef NEW_VERSION
-   // !!! Changed: added B_s
-   mutable Array<HypreParMatrix*> B_s; // Block inverse scaled version of B
-#endif
-   mutable Array<Operator*> B_prec;
-   mutable Array<Solver*> B_solver;
-   int prec_type;
-#ifdef NEW_VERSION
-   // !!! Changed: added blocksize
-   int blocksize;
-#endif
-
-   mutable Vector z; // auxiliary vector
-
-   int GetDtIndex(double dt) const;
-
-public:
-   // !!! Changed: passing in order as well
-#ifdef NEW_VERSION
-   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, const Vector &_b, int order);
-#else
-   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, const Vector &_b);
-#endif
-
-   /** 0 - HypreParaSails, 1 - HypreBoomerAMG, 2 - UMFPackSolver */
-   void SetPreconditionerType(int type) { prec_type = type; }
-
-   virtual void Mult(const Vector &x, Vector &y) const;
-
-   /** Solve the equation: k = f(x + dt*k, t), for the unknown k.
-       For this class the equation becomes:
-          k = f(x + dt*k, t) = M^{-1} (K (x + dt*k) + b),
-       or
-          k = (M - dt*K)^{-1} (K x + b). */
-   virtual void ImplicitSolve(const double dt, const Vector &x, Vector &k);
-
-   /// Compute the M-inner product of x and y: y^t.M.x
-   double InnerProduct(const Vector &x, const Vector &y) const;
-
-   virtual ~FE_Evolution();
-};
-
 
 struct DGAdvectionOptions : public BraidOptions
 {
@@ -151,13 +84,62 @@ struct DGAdvectionOptions : public BraidOptions
    DGAdvectionOptions(int argc, char *argv[]);
 };
 
+/** A time-dependent operator for the right-hand side of the ODE. The DG weak
+    form of du/dt = v.grad(u) is M du/dt = K u + b, where M and K are the mass
+    and advection matrices, and b describes the flow on the boundary. This can
+    be written as a general ODE, du/dt = M^{-1} (K u + b), and this class is
+    used to evaluate the right-hand side. */
+class FE_Evolution : public TimeDependentOperator
+{
+private:
+   DGAdvectionOptions &options;
+   HypreParMatrix &M, &K;
+   const Vector &b;
+   HypreSmoother M_prec;
+   CGSolver M_solver;
+
+   mutable Array<double> dts;
+   mutable Array<HypreParMatrix*> B; // B = M - dt*K, for ImplicitSolve
+   mutable Array<HypreParMatrix*> B_s; // Block inverse scaled version of B
+   mutable Array<Operator*> B_prec;
+   mutable Array<Solver*> B_solver;
+   int prec_type;
+   int blocksize;
+
+   mutable Vector z; // auxiliary vector
+
+   int GetDtIndex(double dt) const;
+
+public:
+   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, const Vector &_b, DGAdvectionOptions &_options);
+
+   /** 0 - HypreParaSails, 1 - HypreBoomerAMG, 2 - UMFPackSolver */
+   void SetPreconditionerType(int type) { prec_type = type; }
+
+   virtual void Mult(const Vector &x, Vector &y) const;
+
+   /** Solve the equation: k = f(x + dt*k, t), for the unknown k.
+       For this class the equation becomes:
+          k = f(x + dt*k, t) = M^{-1} (K (x + dt*k) + b),
+       or
+          k = (M - dt*K)^{-1} (K x + b). */
+   virtual void ImplicitSolve(const double dt, const Vector &x, Vector &k);
+
+   /// Compute the M-inner product of x and y: y^t.M.x
+   double InnerProduct(const Vector &x, const Vector &y) const;
+
+   virtual ~FE_Evolution();
+};
 
 class DGAdvectionApp : public MFEMBraidApp
 {
 protected:
    DGAdvectionOptions &options;
 
-   DG_FECollection fe_coll;
+   // !!! Debug: switching to continuous Galerkin
+   DG_FECollection dg_fe_coll;
+   H1_FECollection h1_fe_coll;
+
 
    VectorFunctionCoefficient velocity;
    FunctionCoefficient inflow;
@@ -231,18 +213,21 @@ int main(int argc, char *argv[])
    {
       opts.PrintOptions(cout);
    }
+   problem = opts.problem;
 
    // Load the mesh and refine it in each processor (serial refinement)
    Mesh *mesh = opts.LoadMeshAndSerialRefine();
    if (!mesh)
    {
-      if (myid == 0)
-      {
-         cerr << "\nError loading mesh file: " << opts.mesh_file
-              << '\n' << endl;
-      }
-      MPI_Finalize();
-      return 2;
+      if (!strcmp(opts.mesh_file,"square")) mesh = new Mesh(8, 8, Element::QUADRILATERAL);
+      else if (!strcmp(opts.mesh_file,"cube")) mesh = new Mesh(4, 4, 4, Element::QUADRILATERAL);
+      // if (myid == 0)
+      // {
+      //    cerr << "\nError loading mesh file: " << opts.mesh_file
+      //         << '\n' << endl;
+      // }
+      // MPI_Finalize();
+      // return 2;
    }
 
    // If the mesh is NURBS, convert it to curved mesh
@@ -250,10 +235,8 @@ int main(int argc, char *argv[])
    {
       mesh->SetCurvature(std::max(opts.order, 1));
    }
-#ifdef NEW_VERSION
    // !!! Changed: getting bounding box info
    mesh->GetBoundingBox(bb_min, bb_max, max(opts.order, 1));
-#endif
 
    // Split comm (MPI_COMM_WORLD) into spatial and temporal communicators
    MPI_Comm comm_x, comm_t;
@@ -274,22 +257,30 @@ int main(int argc, char *argv[])
    core.Drive();
    app.PrintStats(comm);
    
+   // Print the residual convergence factors to file
+   braid_Int num_rnorm = 100; 
+   braid_Real *rnorms = (braid_Real*) calloc(num_rnorm, sizeof(braid_Real));
+   core.GetRNorms(&num_rnorm, rnorms);
+   ofstream outfile;
+   outfile.open("res_nt" + to_string(opts.num_time_steps) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
+   outfile << rnorms[0] << " " << 1.0 << endl;
+   for (auto i = 0; i < num_rnorm-1; i++)
+   {
+      braid_Real cf = rnorms[i+1]/rnorms[i];
+      outfile << rnorms[i+1] << " " << cf << endl;
+   }
+   outfile.close();
+
    MPI_Finalize();
    return 0;
 }
 
 
 // Implementation of class FE_Evolution
-// !!! Changed: passing in order as well
-#ifdef NEW_VERSION
 FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K,
-                           const Vector &_b, int order)
-#else
-FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K,
-                           const Vector &_b)
-#endif
+                           const Vector &_b, DGAdvectionOptions &_options)
    : TimeDependentOperator(_M.Height()),
-     M(_M), K(_K), b(_b), M_solver(M.GetComm()), z(_M.Height())
+     options(_options), M(_M), K(_K), b(_b), M_solver(M.GetComm()), z(_M.Height())
 {
    M_prec.SetType(HypreSmoother::Jacobi);
    M_solver.SetPreconditioner(M_prec);
@@ -301,11 +292,8 @@ FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K,
    M_solver.SetMaxIter(100);
    M_solver.SetPrintLevel(0);
 
-   // !!! Changed: added blocksize
-#ifdef NEW_VERSION
    // DG block size given by (FEorder+1)^2 on square meshes.
-   blocksize = (order+1)*(order+1);
-#endif
+   blocksize = (options.order+1)*(options.order+1);
 }
 
 FE_Evolution::~FE_Evolution()
@@ -315,10 +303,7 @@ FE_Evolution::~FE_Evolution()
       delete B_solver[i];
       delete B_prec[i];
       delete B[i];
-      // !!! Changed: added B_s
-#ifdef NEW_VERSION
       delete B_s[i];
-#endif
    }
 }
 
@@ -339,23 +324,15 @@ int FE_Evolution::GetDtIndex(double dt) const
    hypre_ParCSRMatrixSum(B_new, 1.0, M);
    hypre_ParCSRMatrixSum(B_new, -dt, K);
 
-
-
-
-
-   // !!! Changed: replaced the solver setup below with adaptation of Ben's code
-
-#ifdef NEW_VERSION
    B_s.Append(new HypreParMatrix(B_new));
-   HypreParMatrix &B_s_new = *B_s.Last();
-   BlockInvScal(&B_new, &B_s_new, NULL, NULL, blocksize, 0);
+   HypreParMatrix &B_s_new = *B_s.Last();\
+   if (options.problem != 0) BlockInvScal(&B_new, &B_s_new, NULL, NULL, blocksize, 0);
 
    int print_level = 0;
    HypreBoomerAMG *AMG_solver = new HypreBoomerAMG(B_s_new);
    AMG_solver->SetMaxLevels(50);   
-   // !!! Need to figure out how to determine whether to use AIR
-   int use_AIR = 1;
-   if (use_AIR) {
+
+   if (options.problem != 0) {
       AMG_solver->SetLAIROptions(1.5, "", "FFC", 0.1, 0.01, 0.0,
       100, 3, 0.0, 10, -1, 1);
       // 100, 3, 0.0, 6, -1, 1);
@@ -366,7 +343,6 @@ int FE_Evolution::GetDtIndex(double dt) const
       AMG_solver->SetAggressiveCoarsening(1);
    }
 
-   // !!! Any reason not to use GMRES?
    int use_gmres = 1;
    if (use_gmres) {
       HypreGMRES *GMRES_solver = new HypreGMRES(B_s_new);
@@ -384,53 +360,6 @@ int FE_Evolution::GetDtIndex(double dt) const
       AMG_solver->SetMaxIter(100);
       B_solver.Append(AMG_solver);
    }
-
-#else
-   HypreSolver *B_hs = NULL;
-   Solver *B_prec_new = NULL;
-   Solver *B_solver_new = NULL;
-   if (prec_type == 0)
-   {
-      HypreParaSails *prec = new HypreParaSails(B_new);
-      HYPRE_ParaSailsSetLogging(*prec, 0);
-      B_prec_new = B_hs = prec;
-   }
-   else if (prec_type == 1)
-   {
-      HypreBoomerAMG *prec = new HypreBoomerAMG(B_new);
-      prec->SetPrintLevel(0);
-      B_prec_new = B_hs = prec;
-   }
-   else
-   {
-#ifdef MFEM_USE_SUITESPARSE
-      SparseMatrix B_new_diag;
-      B_new.GetDiag(B_new_diag); // B_new_diag is just a wrapper for the data
-      SparseMatrix *diag_copy = new SparseMatrix(B_new_diag);
-      diag_copy->SortColumnIndices();
-      B_prec.Append(diag_copy);
-      UMFPackSolver *solver = new UMFPackSolver(*diag_copy);
-      B_solver_new = solver;
-#else
-      MFEM_ABORT("MFEM was not compiled with SuiteSparse support!");
-#endif
-   }
-   if (B_prec_new) { B_prec.Append(B_prec_new); }
-
-   if (!B_solver_new)
-   {
-      HypreGMRES *solver = new HypreGMRES(B_new);
-      solver->SetTol(1e-12);
-      solver->SetMaxIter(1000);
-      solver->SetPrintLevel(0);
-      solver->SetPreconditioner(*B_hs);
-      solver->iterative_mode = false;
-      B_solver_new = solver;
-   }
-   B_solver.Append(B_solver_new);
-#endif
-
-
 
    return dts.Size()-1;
 }
@@ -450,14 +379,16 @@ void FE_Evolution::ImplicitSolve(const double dt, const Vector &x, Vector &k)
    K.Mult(x, z);
    z += b;
 
-#ifdef NEW_VERSION
-   // !!! Changed: added block inv scaling from Ben's code
-   HypreParVector b_s;
-   BlockInvScal(B[i], NULL, &z, &b_s, blocksize, 2);
-   B_solver[i]->Mult(b_s, k);
-#else
-   B_solver[i]->Mult(z, k);
-#endif
+   if (options.problem == 0)
+   {
+      B_solver[i]->Mult(z, k);
+   }
+   else
+   {
+      HypreParVector b_s;
+      BlockInvScal(B[i], NULL, &z, &b_s, blocksize, 2);
+      B_solver[i]->Mult(b_s, k);
+   }
 
    if (HYPRE_GetError())
    {
@@ -486,7 +417,8 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    num_procs_x    = 1;
 
    // set defaults for the (optional) mesh/refinement inherited options
-   mesh_file       = "../../../mfem/data/periodic-hexagon.mesh";
+   // mesh_file       = "../../../mfem/data/periodic-hexagon.mesh";
+   mesh_file       = "square";
    ser_ref_levels  = 2;
    par_ref_levels  = 0;
    AddMeshOptions();
@@ -495,7 +427,11 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    problem         = 0;
    diffusion       = 0.0;
    diss_oper_type  = 0; // 0 - diffusion (S), 1 - diffusion squared (S^2)
-   order           = 3;
+   // order           = 3;
+   
+   // !!! Debug: changing to continuous galerkin order 1
+   order = 1;
+
    ode_solver_type = 4;
    basis_type      = 0;
    lump_mass       = false;
@@ -563,14 +499,14 @@ DGAdvectionApp::DGAdvectionApp(
 
    : MFEMBraidApp(comm_t_, opts.t_start, opts.t_final, opts.num_time_steps),
      options(opts),
-     fe_coll(opts.order, pmesh->Dimension(), opts.basis_type),
+     dg_fe_coll(opts.order, pmesh->Dimension(), opts.basis_type),
+     h1_fe_coll(opts.order, pmesh->Dimension()),
      velocity(pmesh->Dimension(), velocity_function),
      inflow(inflow_function),
      u0(u0_function),
      // diff(-opts.diffusion), // diffusion goes in the r.h.s. with a minus
      MeshInfo(opts.max_levels)
 {
-   problem = opts.problem;
    Step_calls_counter = Norm_calls_counter = 0;
 
    InitMultilevelApp(pmesh, opts.par_ref_levels, opts.spatial_coarsen);
@@ -745,7 +681,8 @@ void DGAdvectionApp::AllocLevels(int num_levels)
 // InitMultilevelApp.
 ParFiniteElementSpace *DGAdvectionApp::ConstructFESpace(ParMesh *pmesh)
 {
-   return new ParFiniteElementSpace(pmesh, &fe_coll);
+   if (options.problem == 0) return new ParFiniteElementSpace(pmesh, &h1_fe_coll);
+   else return new ParFiniteElementSpace(pmesh, &dg_fe_coll);
 }
 
 // Assuming mesh[l] and fe_space[l] are set, initialize, ode[l], solver[l],
@@ -755,60 +692,51 @@ void DGAdvectionApp::InitLevel(int l)
    // Create the components needed for the time-dependent operator, ode[l]:
    // the mass matrix, M; the advection (+diffusion) matrix, K; and the inflow
    // b.c. vector, B.
+   const int skip_zeros = 0;
    ParBilinearForm *m = new ParBilinearForm(fe_space[l]);
    if (!options.lump_mass)
       m->AddDomainIntegrator(new MassIntegrator);
    else
       m->AddDomainIntegrator(new LumpedIntegrator(new MassIntegrator));
-   ParBilinearForm *k = new ParBilinearForm(fe_space[l]);
-   k->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
-   k->AddInteriorFaceIntegrator(
-      new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
-   k->AddBdrFaceIntegrator(
-      new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
+
+   if (options.problem != 0)
+   {
+      ParBilinearForm *k = new ParBilinearForm(fe_space[l]);
+      k->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
+      k->AddInteriorFaceIntegrator(
+         new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
+      k->AddBdrFaceIntegrator(
+         new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
+      k->Assemble(skip_zeros);
+      k->Finalize(skip_zeros);
+      K[l] = k->ParallelAssemble();
+      delete k;
+   }
    HypreParMatrix *S = NULL;
 
-   // !!! Changed: moved declaration of sigma and kappa outside and defaulted them to IP method
-#ifdef NEW_VERSION
    double sigma, kappa;
    sigma = -1.0;
    kappa = (options.order+1)*(options.order+1);
-#endif
 
-   if (options.diffusion > 0.0)
+   if (options.diffusion > 0.0 || options.problem == 0)
    {
       ParBilinearForm *s = new ParBilinearForm(fe_space[l]);
-      // !!! Changed: commented out below
-#ifdef NEW_VERSION
-#else
-      double sigma, kappa;
-      if (1)
-      {
-         // IP method
-         sigma = -1.0;
-         kappa = (options.order+1)*(options.order+1);
-      }
-      else
-      {
-         // NIPG method
-         sigma = 1.0;
-         kappa = 1.0;
-      }
-#endif
+
       // S has coefficient one, we multiply by the "diffusion" coefficient,
       // options.diffusion, later.
       ConstantCoefficient one(1.0);
       s->AddDomainIntegrator(new DiffusionIntegrator(one));
-      s->AddInteriorFaceIntegrator(
-         new DGDiffusionIntegrator(one, sigma, kappa));
-      // !!! Changed: added DG face integrator
-#ifdef NEW_VERSION
-      s->AddBdrFaceIntegrator(new DGDiffusionIntegrator(one, sigma, kappa));
-#endif
-      const int skip_zeros = 0;
+      if (options.problem != 0)
+      {
+         s->AddInteriorFaceIntegrator(
+            new DGDiffusionIntegrator(one, sigma, kappa));
+         s->AddBdrFaceIntegrator(new DGDiffusionIntegrator(one, sigma, kappa));
+      }
+
       s->Assemble(skip_zeros);
       s->Finalize(skip_zeros);
       S = s->ParallelAssemble();
+
       delete s;
       if (options.diss_oper_type)
       {
@@ -837,54 +765,57 @@ void DGAdvectionApp::InitLevel(int l)
    }
 
    ParLinearForm *b = new ParLinearForm(fe_space[l]);
-   // !!! Changed: replaced definition of form b with Ben's
-#ifdef NEW_VERSION
+   ConstantCoefficient zero(0.0);
    ConstantCoefficient diff_coef(options.diffusion);
-   b->AddBdrFaceIntegrator(
-      new DGDirichletLFIntegrator(u0, diff_coef, sigma, kappa)); 
-#else
-   b->AddBdrFaceIntegrator(
-      new BoundaryFlowIntegrator(inflow, velocity, -1.0, -0.5));
-#endif
+   if (options.problem == 0)
+   {
+      b->AddDomainIntegrator(new DomainLFIntegrator(zero));
+   }
+   else
+   {
+      b->AddBdrFaceIntegrator( new DGDirichletLFIntegrator(u0, diff_coef, sigma, kappa)); 
+   }
 
    m->Assemble();
    m->Finalize();
-   const int skip_zeros = 0;
-   k->Assemble(skip_zeros);
-   k->Finalize(skip_zeros);
    b->Assemble();
 
    M[l] = m->ParallelAssemble();
-   K[l] = k->ParallelAssemble();
    B[l] = b->ParallelAssemble();
 
    delete b;
-   delete k;
    delete m;
 
    if (S)
    {
       // K[l] := K[l] - diff*S
       *S *= (-options.diffusion);
-      hypre_ParCSRMatrixSum(*S, 1.0, *K[l]);
-      delete K[l];
+
+      if (options.problem != 0)
+      {
+         hypre_ParCSRMatrixSum(*S, 1.0, *K[l]);
+         delete K[l];
+      }
+
       K[l] = S;
    }
 
    if (l == 0 && options.write_matrices)
    {
-      cout << "\nWritting the mass and advection matrices, M and K, for"
+      int myid;
+      MPI_Comm_rank(MPI_COMM_WORLD, &myid);
+      if (myid == 0) cout << "\nWriting the mass and advection matrices, M and K, for"
               " level 0.\n" << endl;
-      M[l]->Print("drive-05-M");
-      K[l]->Print("drive-05-K");
+      // M[l]->Print("drive-05-M");
+      // K[l]->Print("drive-05-K");
+
+      string filename = "K_nt" + to_string(options.num_time_steps);
+      K[l]->Print(filename.c_str());
    }
 
    // Create the time-dependent operator, ode[l]
-#ifdef NEW_VERSION
-   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], *B[l], options.order);
-#else
-   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], *B[l]);
-#endif
+   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], *B[l], options);
+
    fe_ev->SetPreconditionerType(options.prec_type);
    ode[l] = fe_ev;
 
@@ -935,9 +866,6 @@ void DGAdvectionApp::PrintStats(MPI_Comm comm)
    MeshInfo.Print(comm);
 }
 
-
-// !!! Changed: replaced the velocity_function and initial condition with Ben's
-#ifdef NEW_VERSION
 // Velocity coefficient
 void velocity_function(const Vector &x, Vector &v)
 {
@@ -955,6 +883,17 @@ void velocity_function(const Vector &x, Vector &v)
    {
       case 0:
       {
+         // Zero
+         switch (dim)
+         {
+            case 1: v(0) = 0.0; break;
+            case 2: v(0) = 0.0; v(1) = 0.0; break;
+            case 3: v(0) = 0.0; v(1) = 0.0; v(2) = 0.0;
+               break;
+         }
+         break;
+      }
+      case 1:
          // Translations in 1D, 2D, and 3D
          switch (dim)
          {
@@ -964,8 +903,6 @@ void velocity_function(const Vector &x, Vector &v)
                break;
          }
          break;
-      }
-      case 1:
       case 2:
       {
          // Clockwise rotation in 2D around the origin
@@ -1047,102 +984,6 @@ double u0_function(Vector &x)
    }
    return 0.0;
 }
-#else
-// Velocity coefficient
-void velocity_function(const Vector &x, Vector &v)
-{
-   int dim = x.Size();
-
-   switch (problem)
-   {
-      case 0:
-      {
-         // Translations in 1D, 2D, and 3D
-         switch (dim)
-         {
-            case 1: v(0) = 1.0; break;
-            case 2: v(0) = sqrt(2./3.); v(1) = sqrt(1./3.); break;
-            case 3: v(0) = sqrt(3./6.); v(1) = sqrt(2./6.); v(2) = sqrt(1./6.);
-               break;
-         }
-         break;
-      }
-      case 1:
-      case 2:
-      {
-         // Clockwise rotation in 2D around the origin
-         const double w = M_PI/2;
-         switch (dim)
-         {
-            case 1: v(0) = 1.0; break;
-            case 2: v(0) = w*x(1); v(1) = -w*x(0); break;
-            case 3: v(0) = w*x(1); v(1) = -w*x(0); v(2) = 0.0; break;
-         }
-         break;
-      }
-      case 3:
-      {
-         // Clockwise twisting rotation in 2D around the origin
-         const double w = M_PI/2;
-         double d = max((x(0)+1.)*(1.-x(0)),0.) * max((x(1)+1.)*(1.-x(1)),0.);
-         d = d*d;
-         switch (dim)
-         {
-            case 1: v(0) = 1.0; break;
-            case 2: v(0) = d*w*x(1); v(1) = -d*w*x(0); break;
-            case 3: v(0) = d*w*x(1); v(1) = -d*w*x(0); v(2) = 0.0; break;
-         }
-         break;
-      }
-   }
-}
-
-// Initial condition
-double u0_function(Vector &x)
-{
-   int dim = x.Size();
-
-   switch (problem)
-   {
-      case 0:
-      case 1:
-      {
-         switch (dim)
-         {
-            case 1:
-               return exp(-40.*pow(x(0)-0.5,2));
-            case 2:
-            case 3:
-            {
-               double rx = 0.45, ry = 0.25, cx = 0., cy = -0.2, w = 10.;
-               if (dim == 3)
-               {
-                  const double s = (1. + 0.25*cos(2*M_PI*x(2)));
-                  rx *= s;
-                  ry *= s;
-               }
-               return ( erfc(w*(x(0)-cx-rx))*erfc(-w*(x(0)-cx+rx)) *
-                        erfc(w*(x(1)-cy-ry))*erfc(-w*(x(1)-cy+ry)) )/16;
-            }
-         }
-      }
-      case 2:
-      {
-         const double r = sqrt(8.);
-         double x_ = x(0), y_ = x(1), rho, phi;
-         rho = hypot(x_, y_) / r;
-         phi = atan2(y_, x_);
-         return pow(sin(M_PI*rho),2)*sin(3*phi);
-      }
-      case 3:
-      {
-         const double f = M_PI;
-         return sin(f*x(0))*sin(f*x(1));
-      }
-   }
-   return 0.0;
-}
-#endif
 
 // Inflow boundary condition (zero for the problems considered in this example)
 double inflow_function(Vector &x)

@@ -25,6 +25,7 @@
 #include "braid.hpp"
 #include "mfem.hpp"
 #include <fstream>
+#include <iostream>
 #include <cstdlib> // rand, srand
 
 using namespace mfem;
@@ -801,6 +802,20 @@ int MFEMBraidApp::Access(braid_Vector       u_,
    {
       (*x[level]) = *u; // Distribute
 
+      // Save the mesh and the solution in parallel. This output can
+      // be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
+      std::ostringstream mesh_name, sol_name;
+      mesh_name << "mesh." << std::setfill('0') << std::setw(6) << mesh[level]->GetMyRank();
+      sol_name << "sol." << std::setfill('0') << std::setw(6) << mesh[level]->GetMyRank();
+
+      std::ofstream mesh_ofs(mesh_name.str().c_str());
+      mesh_ofs.precision(8);
+      mesh[level]->Print(mesh_ofs);
+
+      std::ofstream sol_ofs(sol_name.str().c_str());
+      sol_ofs.precision(8);
+      x[level]->Save(sol_ofs);
+
       // Opening multiple 'parallel' connections to GLVis simultaneously
       // (from different time intervals in this case) may cause incorrect
       // behavior.
@@ -810,14 +825,7 @@ int MFEMBraidApp::Access(braid_Vector       u_,
       {
          sol_sock.open(vishost, visport);
          init_sock = 1;
-
-         // Debug
-         std::cout << "sol sock not open, init_sock = " << init_sock << std::endl;
       }
-
-       // Debug
-       std::cout << "init_sock = " << init_sock << std::endl;
-
 
       int good, all_good;
       good = sol_sock.good();
