@@ -60,6 +60,7 @@ double inflow_function(Vector &x);
 struct DGAdvectionOptions : public BraidOptions
 {
    int    problem;
+   bool   dirichlet_bcs;
    double diffusion;
    int    order;
    int    ode_solver_type;
@@ -325,7 +326,7 @@ int FE_Evolution::GetDtIndex(double dt) const
    hypre_ParCSRMatrixSum(B_new, -dt, K);
 
    B_s.Append(new HypreParMatrix(B_new));
-   HypreParMatrix &B_s_new = *B_s.Last();\
+   HypreParMatrix &B_s_new = *B_s.Last();
    if (options.problem != 0) BlockInvScal(&B_new, &B_s_new, NULL, NULL, blocksize, 0);
 
    int print_level = 0;
@@ -425,6 +426,7 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
 
    // set defaults for the DGAdvection-specific options
    problem         = 0;
+   dirichlet_bcs   = false;
    diffusion       = 0.0;
    diss_oper_type  = 0; // 0 - diffusion (S), 1 - diffusion squared (S^2)
    // order           = 3;
@@ -487,6 +489,9 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    AddOption(&write_matrices, "-wm", "--write-matrices",
              "-dont-wm", "--dont-write-matrices", "Enable/disable the saving of"
              " the fine level mass (M) and advection (K) matrices.");
+   AddOption(&dirichlet_bcs, "-dbc", "--dirichlet-boundary-conditions",
+             "-ndbc", "--no-dirichlet-boundary-conditions", "Enable/disable "
+             " Dirichlet BCs (for problem = 0, diffusion only).");
 
    Parse();
 
@@ -689,6 +694,10 @@ ParFiniteElementSpace *DGAdvectionApp::ConstructFESpace(ParMesh *pmesh)
 // and max_dt[l]. Used by InitMultilevelApp.
 void DGAdvectionApp::InitLevel(int l)
 {
+
+   int myid;
+   MPI_Comm_rank(MPI_COMM_WORLD, &myid);
+
    // Create the components needed for the time-dependent operator, ode[l]:
    // the mass matrix, M; the advection (+diffusion) matrix, K; and the inflow
    // b.c. vector, B.
@@ -699,7 +708,47 @@ void DGAdvectionApp::InitLevel(int l)
    else
       m->AddDomainIntegrator(new LumpedIntegrator(new MassIntegrator));
 
-   if (options.problem != 0)
+   if (options.problem == 0)
+   {
+      // Zero RHS source terms
+      ParLinearForm *b = new ParLinearForm(fe_space[l]);
+      ConstantCoefficient zero(0.0);
+      b->AddDomainIntegrator(new DomainLFIntegrator(zero));
+      b->Assemble();
+
+      // Diffusion operator
+      ParBilinearForm *k = new ParBilinearForm(fe_space[l]);
+      ConstantCoefficient diff_coef(-options.diffusion);
+      k->AddDomainIntegrator(new DiffusionIntegrator(diff_coef));
+      k->Assemble();
+
+      // Assmeble mass matrix and rhs vector
+      m->Assemble();
+
+      // Set Dirichlet BCs if requested
+      if (options.dirichlet_bcs)
+      {
+         Array<int> ess_bdr(mesh[l]->bdr_attributes.Max());
+         ess_bdr = 1;
+         ParGridFunction *u = new ParGridFunction(fe_space[l]);
+         u->ProjectCoefficient(u0);
+         k->EliminateEssentialBC(ess_bdr, *u, *b);
+         m->EliminateEssentialBC(ess_bdr, *u, *b);
+         delete u;
+      }
+
+      // Finalize and assemble matrices
+      k->Finalize();
+      m->Finalize();
+      K[l] = k->ParallelAssemble();
+      M[l] = m->ParallelAssemble();
+      B[l] = b->ParallelAssemble();
+
+      delete m;
+      delete k;
+      delete b;
+   }
+   else
    {
       ParBilinearForm *k = new ParBilinearForm(fe_space[l]);
       k->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
@@ -707,109 +756,96 @@ void DGAdvectionApp::InitLevel(int l)
          new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
       k->AddBdrFaceIntegrator(
          new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
-      k->Assemble(skip_zeros);
-      k->Finalize(skip_zeros);
-      K[l] = k->ParallelAssemble();
-      delete k;
-   }
-   HypreParMatrix *S = NULL;
 
-   double sigma, kappa;
-   sigma = -1.0;
-   kappa = (options.order+1)*(options.order+1);
+      double sigma, kappa;
+      sigma = -1.0;
+      kappa = (options.order+1)*(options.order+1);
 
-   if (options.diffusion > 0.0 || options.problem == 0)
-   {
-      ParBilinearForm *s = new ParBilinearForm(fe_space[l]);
-
-      // S has coefficient one, we multiply by the "diffusion" coefficient,
-      // options.diffusion, later.
-      ConstantCoefficient one(1.0);
-      s->AddDomainIntegrator(new DiffusionIntegrator(one));
-      if (options.problem != 0)
+      HypreParMatrix *S = NULL;
+      if (options.diffusion > 0.0)
       {
+
+         ParBilinearForm *s = new ParBilinearForm(fe_space[l]);
+
+         // S has coefficient one, we multiply by the "diffusion" coefficient,
+         // options.diffusion, later.
+         ConstantCoefficient one(1.0);
+         s->AddDomainIntegrator(new DiffusionIntegrator(one));
          s->AddInteriorFaceIntegrator(
             new DGDiffusionIntegrator(one, sigma, kappa));
          s->AddBdrFaceIntegrator(new DGDiffusionIntegrator(one, sigma, kappa));
-      }
-
-      s->Assemble(skip_zeros);
-      s->Finalize(skip_zeros);
-      S = s->ParallelAssemble();
-
-      delete s;
-      if (options.diss_oper_type)
-      {
-         // S := S M^{-1} S
-         // a) assemble M^{-1}
-         HypreParMatrix *Mi;
+         s->Assemble(skip_zeros);
+         s->Finalize(skip_zeros);
+         S = s->ParallelAssemble();
+         delete s;
+         if (options.diss_oper_type)
          {
-            ParBilinearForm mi(fe_space[l]);
-            if (!options.lump_mass)
-               mi.AddDomainIntegrator(
-                  new InverseIntegrator(new MassIntegrator));
-            else
-               mi.AddDomainIntegrator(
-                  new InverseIntegrator(
-                     new LumpedIntegrator(new MassIntegrator)));
-            mi.Assemble();
-            mi.Finalize();
-            Mi = mi.ParallelAssemble();
+            // S := S M^{-1} S
+            // a) assemble M^{-1}
+            HypreParMatrix *Mi;
+            {
+               ParBilinearForm mi(fe_space[l]);
+               if (!options.lump_mass)
+                  mi.AddDomainIntegrator(
+                     new InverseIntegrator(new MassIntegrator));
+               else
+                  mi.AddDomainIntegrator(
+                     new InverseIntegrator(
+                        new LumpedIntegrator(new MassIntegrator)));
+               mi.Assemble();
+               mi.Finalize();
+               Mi = mi.ParallelAssemble();
+            }
+            HypreParMatrix *MiS = mfem::ParMult(Mi, S);
+            delete Mi;
+            HypreParMatrix *SMiS = mfem::ParMult(S, MiS);
+            delete S;
+            S = SMiS;
          }
-         HypreParMatrix *MiS = mfem::ParMult(Mi, S);
-         delete Mi;
-         HypreParMatrix *SMiS = mfem::ParMult(S, MiS);
-         delete S;
-         S = SMiS;
       }
-   }
 
-   ParLinearForm *b = new ParLinearForm(fe_space[l]);
-   ConstantCoefficient zero(0.0);
-   ConstantCoefficient diff_coef(options.diffusion);
-   if (options.problem == 0)
-   {
-      b->AddDomainIntegrator(new DomainLFIntegrator(zero));
-   }
-   else
-   {
+      ParLinearForm *b = new ParLinearForm(fe_space[l]);
+      ConstantCoefficient diff_coef(options.diffusion);
       b->AddBdrFaceIntegrator( new DGDirichletLFIntegrator(u0, diff_coef, sigma, kappa)); 
-   }
+      
+      m->Assemble();
+      m->Finalize();
+      k->Assemble(skip_zeros);
+      k->Finalize(skip_zeros);
+      b->Assemble();
 
-   m->Assemble();
-   m->Finalize();
-   b->Assemble();
+      M[l] = m->ParallelAssemble();
+      K[l] = k->ParallelAssemble();
+      B[l] = b->ParallelAssemble();
 
-   M[l] = m->ParallelAssemble();
-   B[l] = b->ParallelAssemble();
+      delete b;
+      delete k;
+      delete m;
 
-   delete b;
-   delete m;
-
-   if (S)
-   {
-      // K[l] := K[l] - diff*S
-      *S *= (-options.diffusion);
-
-      if (options.problem != 0)
+      if (S)
       {
-         hypre_ParCSRMatrixSum(*S, 1.0, *K[l]);
-         delete K[l];
-      }
+         // K[l] := K[l] - diff*S
+         *S *= (-options.diffusion);
 
-      K[l] = S;
+         if (options.problem != 0)
+         {
+            hypre_ParCSRMatrixSum(*S, 1.0, *K[l]);
+            delete K[l];
+         }
+
+         K[l] = S;
+      }
    }
 
    if (l == 0 && options.write_matrices)
    {
-      int myid;
-      MPI_Comm_rank(MPI_COMM_WORLD, &myid);
       if (myid == 0) cout << "\nWriting the mass and advection matrices, M and K, for"
               " level 0.\n" << endl;
       // M[l]->Print("drive-05-M");
       // K[l]->Print("drive-05-K");
-
-      string filename = "K_nt" + to_string(options.num_time_steps);
+      string filename = "M_nt" + to_string(options.num_time_steps);
+      M[l]->Print(filename.c_str());
+      filename = "K_nt" + to_string(options.num_time_steps);
       K[l]->Print(filename.c_str());
    }
 
@@ -948,6 +984,17 @@ double u0_function(Vector &x)
    switch (problem)
    {
       case 0:
+      {
+         switch (dim)
+         {
+            case 1:
+               return cos((M_PI/2.0)*X(0));
+            case 2:
+               return cos((M_PI/2.0)*X(0))*cos((M_PI/2.0)*X(1));
+            case 3:
+               return cos((M_PI/2.0)*X(0))*cos((M_PI/2.0)*X(1))*cos((M_PI/2.0)*X(2));
+         }
+      }
       case 1:
       {
          switch (dim)

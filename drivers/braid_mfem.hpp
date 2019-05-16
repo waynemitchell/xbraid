@@ -806,7 +806,7 @@ int MFEMBraidApp::Access(braid_Vector       u_,
       // be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
       std::ostringstream mesh_name, sol_name;
       mesh_name << "mesh." << std::setfill('0') << std::setw(6) << mesh[level]->GetMyRank();
-      sol_name << "sol." << std::setfill('0') << std::setw(6) << mesh[level]->GetMyRank();
+      sol_name << "sol" << cycle << "." << std::setfill('0') << std::setw(6) << mesh[level]->GetMyRank();
 
       std::ofstream mesh_ofs(mesh_name.str().c_str());
       mesh_ofs.precision(8);
@@ -831,9 +831,6 @@ int MFEMBraidApp::Access(braid_Vector       u_,
       good = sol_sock.good();
       MPI_Allreduce(&good, &all_good, 1, MPI_INT, MPI_LAND,
                     mesh[level]->GetComm());
-
-     // Debug
-     std::cout << "all_good = " << all_good << std::endl;
 
       if (all_good)
       {
