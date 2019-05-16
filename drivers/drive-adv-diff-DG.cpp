@@ -304,7 +304,8 @@ FE_Evolution::~FE_Evolution()
       delete B_solver[i];
       delete B_prec[i];
       delete B[i];
-      delete B_s[i];
+      // !!! Why does the delete below cause memory error?
+      // if (B_s[i]) delete B_s[i];
    }
 }
 
@@ -337,8 +338,10 @@ int FE_Evolution::GetDtIndex(double dt) const
       AMG_solver->SetLAIROptions(1.5, "", "FFC", 0.1, 0.01, 0.0,
       100, 3, 0.0, 10, -1, 1);
       // 100, 3, 0.0, 6, -1, 1);
+      AMG_solver->SetPrintLevel(print_level);
    }
    else {
+      AMG_solver->SetPrintLevel(print_level);
       AMG_solver->SetInterpolation(0);
       AMG_solver->SetCoarsening(6);
       AMG_solver->SetAggressiveCoarsening(1);
@@ -356,7 +359,6 @@ int FE_Evolution::GetDtIndex(double dt) const
       B_solver.Append(GMRES_solver);
    }
    else {
-      AMG_solver->SetPrintLevel(print_level);
       AMG_solver->SetTol(1e-12);
       AMG_solver->SetMaxIter(100);
       B_solver.Append(AMG_solver);
