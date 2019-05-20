@@ -183,6 +183,7 @@ public:
    virtual ~DGAdvectionApp();
 
    void PrintStats(MPI_Comm comm);
+   void PlotMode();
 };
 
 
@@ -255,22 +256,29 @@ int main(int argc, char *argv[])
    BraidCore core(comm, &app);
    opts.SetBraidCoreOptions(core);
 
-   core.Drive();
-   app.PrintStats(comm);
-   
-   // Print the residual convergence factors to file
-   braid_Int num_rnorm = 100; 
-   braid_Real *rnorms = (braid_Real*) calloc(num_rnorm, sizeof(braid_Real));
-   core.GetRNorms(&num_rnorm, rnorms);
-   ofstream outfile;
-   outfile.open("res_nt" + to_string(opts.num_time_steps) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
-   outfile << rnorms[0] << " " << 1.0 << endl;
-   for (auto i = 0; i < num_rnorm-1; i++)
+   if (1)
    {
-      braid_Real cf = rnorms[i+1]/rnorms[i];
-      outfile << rnorms[i+1] << " " << cf << endl;
+      app.PlotMode();
    }
-   outfile.close();
+   else
+   {
+      core.Drive();
+      app.PrintStats(comm);
+      
+      // Print the residual convergence factors to file
+      braid_Int num_rnorm = 100; 
+      braid_Real *rnorms = (braid_Real*) calloc(num_rnorm, sizeof(braid_Real));
+      core.GetRNorms(&num_rnorm, rnorms);
+      ofstream outfile;
+      outfile.open("res_nt" + to_string(opts.num_time_steps) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
+      outfile << rnorms[0] << " " << 1.0 << endl;
+      for (auto i = 0; i < num_rnorm-1; i++)
+      {
+         braid_Real cf = rnorms[i+1]/rnorms[i];
+         outfile << rnorms[i+1] << " " << cf << endl;
+      }
+      outfile.close();
+   }
 
    MPI_Finalize();
    return 0;
@@ -904,6 +912,31 @@ void DGAdvectionApp::PrintStats(MPI_Comm comm)
    MeshInfo.Print(comm);
 }
 
+void DGAdvectionApp::PlotMode()
+{
+
+
+   HYPRE_ParVector readHypreVector = hypre_ParVectorRead(mesh[0]->GetComm(), "slowMode_nt500");
+
+   HypreParVector mfemHypreVector(readHypreVector);
+
+   ParGridFunction plotGridFunction(fe_space[0], mfemHypreVector);
+
+   // Save the mesh and the solution in parallel. This output can
+   // be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
+   std::ostringstream mesh_name, sol_name;
+   mesh_name << "modeMesh." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+   sol_name << "slowMode." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+
+   std::ofstream mesh_ofs(mesh_name.str().c_str());
+   mesh_ofs.precision(8);
+   mesh[0]->Print(mesh_ofs);
+
+   std::ofstream sol_ofs(sol_name.str().c_str());
+   sol_ofs.precision(8);
+   plotGridFunction.Save(sol_ofs);
+}
+
 // Velocity coefficient
 void velocity_function(const Vector &x, Vector &v)
 {
@@ -990,11 +1023,11 @@ double u0_function(Vector &x)
          switch (dim)
          {
             case 1:
-               return cos((M_PI/2.0)*X(0));
+               return (X(0) - 1.0)*(X(0) + 1.0);
             case 2:
-               return cos((M_PI/2.0)*X(0))*cos((M_PI/2.0)*X(1));
+               return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0);
             case 3:
-               return cos((M_PI/2.0)*X(0))*cos((M_PI/2.0)*X(1))*cos((M_PI/2.0)*X(2));
+               return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0)*(X(2) - 1.0)*(X(2) + 1.0);
          }
       }
       case 1:
