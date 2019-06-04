@@ -48,6 +48,9 @@ using namespace hypre;
 int problem;
 Vector bb_min, bb_max;
 
+// Source function
+double source_function(Vector &x, double t);
+
 // Velocity coefficient
 void velocity_function(const Vector &x, Vector &v);
 
@@ -59,8 +62,8 @@ double inflow_function(Vector &x);
 
 struct DGAdvectionOptions : public BraidOptions
 {
+   bool   plot_mode;
    int    problem;
-   bool   dirichlet_bcs;
    double diffusion;
    int    order;
    int    ode_solver_type;
@@ -72,6 +75,7 @@ struct DGAdvectionOptions : public BraidOptions
    bool   init_rand;
    int    prec_type; // passed down to FE_Evolution
    int    diss_oper_type;
+   bool   dirichlet_bcs;
 
    const char *vishost;
    int         visport;
@@ -95,7 +99,11 @@ class FE_Evolution : public TimeDependentOperator
 private:
    DGAdvectionOptions &options;
    HypreParMatrix &M, &K;
-   const Vector &b;
+   ParBilinearForm *m_form, *k_form;
+   FunctionCoefficient &source;
+   Array<int> &ess_dof_list;
+   ParLinearForm *b_form;
+   HypreParVector *b;
    HypreSmoother M_prec;
    CGSolver M_solver;
 
@@ -112,12 +120,13 @@ private:
    int GetDtIndex(double dt) const;
 
 public:
-   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, const Vector &_b, DGAdvectionOptions &_options);
+   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, ParBilinearForm *_m_form, ParBilinearForm *_k_form,
+                           HypreParVector *_b, ParLinearForm *_b_form, FunctionCoefficient &_source, Array<int> &_ess_dof_list, DGAdvectionOptions &_options);
 
    /** 0 - HypreParaSails, 1 - HypreBoomerAMG, 2 - UMFPackSolver */
    void SetPreconditionerType(int type) { prec_type = type; }
 
-   virtual void Mult(const Vector &x, Vector &y) const;
+   virtual void Mult(const Vector &x, Vector &y);
 
    /** Solve the equation: k = f(x + dt*k, t), for the unknown k.
        For this class the equation becomes:
@@ -141,7 +150,9 @@ protected:
    DG_FECollection dg_fe_coll;
    H1_FECollection h1_fe_coll;
 
+   Array<int> ess_dof_list;
 
+   FunctionCoefficient source;
    VectorFunctionCoefficient velocity;
    FunctionCoefficient inflow;
    FunctionCoefficient u0;
@@ -151,6 +162,10 @@ protected:
    Array<HypreParMatrix *> M; // mass matrices
    Array<HypreParMatrix *> K; // advection matrices
    Array<HypreParVector *> B; // r.h.s. vectors
+
+   ParBilinearForm *m;
+   ParBilinearForm *k;
+   ParLinearForm *b;
 
    int Step_calls_counter, Norm_calls_counter;
 
@@ -221,8 +236,8 @@ int main(int argc, char *argv[])
    Mesh *mesh = opts.LoadMeshAndSerialRefine();
    if (!mesh)
    {
-      if (!strcmp(opts.mesh_file,"square")) mesh = new Mesh(8, 8, Element::QUADRILATERAL);
-      else if (!strcmp(opts.mesh_file,"cube")) mesh = new Mesh(4, 4, 4, Element::QUADRILATERAL);
+      if (!strcmp(opts.mesh_file,"square")) mesh = new Mesh(2, 2, Element::QUADRILATERAL);
+      else if (!strcmp(opts.mesh_file,"cube")) mesh = new Mesh(2, 2, 2, Element::QUADRILATERAL);
       // if (myid == 0)
       // {
       //    cerr << "\nError loading mesh file: " << opts.mesh_file
@@ -256,7 +271,7 @@ int main(int argc, char *argv[])
    BraidCore core(comm, &app);
    opts.SetBraidCoreOptions(core);
 
-   if (1)
+   if (opts.plot_mode)
    {
       app.PlotMode();
    }
@@ -270,7 +285,7 @@ int main(int argc, char *argv[])
       braid_Real *rnorms = (braid_Real*) calloc(num_rnorm, sizeof(braid_Real));
       core.GetRNorms(&num_rnorm, rnorms);
       ofstream outfile;
-      outfile.open("res_nt" + to_string(opts.num_time_steps) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
+      outfile.open("res_size" + to_string(opts.par_ref_levels) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
       outfile << rnorms[0] << " " << 1.0 << endl;
       for (auto i = 0; i < num_rnorm-1; i++)
       {
@@ -286,10 +301,10 @@ int main(int argc, char *argv[])
 
 
 // Implementation of class FE_Evolution
-FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K,
-                           const Vector &_b, DGAdvectionOptions &_options)
+FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, ParBilinearForm *_m_form, ParBilinearForm *_k_form,
+                           HypreParVector *_b, ParLinearForm *_b_form, FunctionCoefficient &_source, Array<int> &_ess_dof_list, DGAdvectionOptions &_options)
    : TimeDependentOperator(_M.Height()),
-     options(_options), M(_M), K(_K), b(_b), M_solver(M.GetComm()), z(_M.Height())
+     options(_options), M(_M), K(_K), m_form(_m_form), k_form(_k_form), source(_source), ess_dof_list(_ess_dof_list), b_form(_b_form),b(_b), M_solver(M.GetComm()), z(_M.Height())
 {
    M_prec.SetType(HypreSmoother::Jacobi);
    M_solver.SetPreconditioner(M_prec);
@@ -375,20 +390,55 @@ int FE_Evolution::GetDtIndex(double dt) const
    return dts.Size()-1;
 }
 
-void FE_Evolution::Mult(const Vector &x, Vector &y) const
+void FE_Evolution::Mult(const Vector &x, Vector &y) 
 {
+  // Setup time-dependent source term if needed
+  if (options.dirichlet_bcs)
+  {
+    FunctionCoefficient u0(u0_function);
+    ParGridFunction *u = new ParGridFunction(b_form->ParFESpace());
+    u->ProjectCoefficient(u0);
+    Array<int> ess_bdr(b_form->ParFESpace()->GetParMesh()->bdr_attributes.Max());
+    ess_bdr = 1;
+    source.SetTime(this->GetTime());
+    b_form->Assemble();
+    k_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
+    m_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
+    delete b;
+    delete u;
+    b = b_form->ParallelAssemble();
+  }
+
    // y = M^{-1} (K x + b)
    K.Mult(x, z);
-   z += b;
+   z += *b;
    M_solver.Mult(z, y);
 }
 
 void FE_Evolution::ImplicitSolve(const double dt, const Vector &x, Vector &k)
 {
+
+  // Setup time-dependent source term if needed
+  if (options.dirichlet_bcs)
+  {
+    FunctionCoefficient u0(u0_function);
+    ParGridFunction *u = new ParGridFunction(b_form->ParFESpace());
+    u->ProjectCoefficient(u0);
+    Array<int> ess_bdr(b_form->ParFESpace()->GetParMesh()->bdr_attributes.Max());
+    ess_bdr = 1;
+    source.SetTime(this->GetTime());
+    b_form->Assemble();
+    k_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
+    m_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
+    delete b;
+    delete u;
+    b = b_form->ParallelAssemble();
+  }
+
    // k = (M - dt*K)^{-1} (K x + b)
    int i = GetDtIndex(dt);
    K.Mult(x, z);
-   z += b;
+   z += *b;
 
    if (options.problem == 0)
    {
@@ -428,15 +478,15 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    num_procs_x    = 1;
 
    // set defaults for the (optional) mesh/refinement inherited options
-   // mesh_file       = "../../../mfem/data/periodic-hexagon.mesh";
-   mesh_file       = "square";
+   mesh_file       = "/home/nfs/wmitchell/Documents/mfem/data/periodic-square.mesh";
+   // mesh_file       = "square";
    ser_ref_levels  = 2;
    par_ref_levels  = 0;
    AddMeshOptions();
 
    // set defaults for the DGAdvection-specific options
+   plot_mode       = false;
    problem         = 0;
-   dirichlet_bcs   = false;
    diffusion       = 0.0;
    diss_oper_type  = 0; // 0 - diffusion (S), 1 - diffusion squared (S^2)
    // order           = 3;
@@ -457,7 +507,11 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    vis_braid_steps = 0;
    vis_screenshots = false;
    write_matrices  = false;
+   dirichlet_bcs   = true;
 
+   AddOption(&plot_mode, "-pltmode", "--plot-mode",
+             "-npltmode", "--no-plot-mode", "Enable/disable "
+             " plot mode (if enabled, does not run any solve, just reads from file and plots).");
    AddOption(&problem, "-p", "--problem",
              "Problem setup to use. See options in velocity_function().");
    AddOption(&diffusion, "-diff", "--diffusion", "Diffusion coefficient.");
@@ -499,11 +553,13 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    AddOption(&write_matrices, "-wm", "--write-matrices",
              "-dont-wm", "--dont-write-matrices", "Enable/disable the saving of"
              " the fine level mass (M) and advection (K) matrices.");
-   AddOption(&dirichlet_bcs, "-dbc", "--dirichlet-boundary-conditions",
-             "-ndbc", "--no-dirichlet-boundary-conditions", "Enable/disable "
-             " Dirichlet BCs (for problem = 0, diffusion only).");
+   AddOption(&dirichlet_bcs, "-dbc", "--dirichlet-bcs",
+             "-ndbc", "--no-dirichlet-bcs", "Enable/disable "
+             "Dirichlet boundary conditions.");
 
    Parse();
+
+   if (problem == 0 && diffusion == 0.0) diffusion = 1.0;
 
    dt = (t_final - t_start) / num_time_steps;
 }
@@ -516,6 +572,7 @@ DGAdvectionApp::DGAdvectionApp(
      options(opts),
      dg_fe_coll(opts.order, pmesh->Dimension(), opts.basis_type),
      h1_fe_coll(opts.order, pmesh->Dimension()),
+     source(source_function),
      velocity(pmesh->Dimension(), velocity_function),
      inflow(inflow_function),
      u0(u0_function),
@@ -551,6 +608,8 @@ DGAdvectionApp::~DGAdvectionApp()
       delete B[l];
       delete K[l];
       delete M[l];
+      delete m;
+      delete k;
    }
 }
 
@@ -712,22 +771,21 @@ void DGAdvectionApp::InitLevel(int l)
    // the mass matrix, M; the advection (+diffusion) matrix, K; and the inflow
    // b.c. vector, B.
    const int skip_zeros = 0;
-   ParBilinearForm *m = new ParBilinearForm(fe_space[l]);
+   m = new ParBilinearForm(fe_space[l]);
    if (!options.lump_mass)
       m->AddDomainIntegrator(new MassIntegrator);
    else
       m->AddDomainIntegrator(new LumpedIntegrator(new MassIntegrator));
 
+   b = new ParLinearForm(fe_space[l]);
+
    if (options.problem == 0)
    {
-      // Zero RHS source terms
-      ParLinearForm *b = new ParLinearForm(fe_space[l]);
-      ConstantCoefficient zero(0.0);
-      b->AddDomainIntegrator(new DomainLFIntegrator(zero));
+      b->AddDomainIntegrator(new DomainLFIntegrator(source));
       b->Assemble();
 
       // Diffusion operator
-      ParBilinearForm *k = new ParBilinearForm(fe_space[l]);
+      k = new ParBilinearForm(fe_space[l]);
       ConstantCoefficient diff_coef(-options.diffusion);
       k->AddDomainIntegrator(new DiffusionIntegrator(diff_coef));
       k->Assemble();
@@ -744,8 +802,10 @@ void DGAdvectionApp::InitLevel(int l)
          u->ProjectCoefficient(u0);
          k->EliminateEssentialBC(ess_bdr, *u, *b);
          m->EliminateEssentialBC(ess_bdr, *u, *b);
+         fe_space[l]->GetEssentialTrueDofs(ess_bdr, ess_dof_list);
          delete u;
       }
+      
 
       // Finalize and assemble matrices
       k->Finalize();
@@ -753,14 +813,10 @@ void DGAdvectionApp::InitLevel(int l)
       K[l] = k->ParallelAssemble();
       M[l] = m->ParallelAssemble();
       B[l] = b->ParallelAssemble();
-
-      delete m;
-      delete k;
-      delete b;
    }
    else
    {
-      ParBilinearForm *k = new ParBilinearForm(fe_space[l]);
+      k = new ParBilinearForm(fe_space[l]);
       k->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
       k->AddInteriorFaceIntegrator(
          new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
@@ -783,7 +839,7 @@ void DGAdvectionApp::InitLevel(int l)
          s->AddDomainIntegrator(new DiffusionIntegrator(one));
          s->AddInteriorFaceIntegrator(
             new DGDiffusionIntegrator(one, sigma, kappa));
-         s->AddBdrFaceIntegrator(new DGDiffusionIntegrator(one, sigma, kappa));
+         // s->AddBdrFaceIntegrator(new DGDiffusionIntegrator(one, sigma, kappa));
          s->Assemble(skip_zeros);
          s->Finalize(skip_zeros);
          S = s->ParallelAssemble();
@@ -815,8 +871,7 @@ void DGAdvectionApp::InitLevel(int l)
       }
 
       ParLinearForm *b = new ParLinearForm(fe_space[l]);
-      ConstantCoefficient diff_coef(options.diffusion);
-      b->AddBdrFaceIntegrator( new DGDirichletLFIntegrator(u0, diff_coef, sigma, kappa)); 
+      b->AddBdrFaceIntegrator( new BoundaryFlowIntegrator(inflow, velocity, -1.0, -0.5));
       
       m->Assemble();
       m->Finalize();
@@ -828,20 +883,13 @@ void DGAdvectionApp::InitLevel(int l)
       K[l] = k->ParallelAssemble();
       B[l] = b->ParallelAssemble();
 
-      delete b;
-      delete k;
-      delete m;
-
       if (S)
       {
          // K[l] := K[l] - diff*S
          *S *= (-options.diffusion);
 
-         if (options.problem != 0)
-         {
-            hypre_ParCSRMatrixSum(*S, 1.0, *K[l]);
-            delete K[l];
-         }
+         hypre_ParCSRMatrixSum(*S, 1.0, *K[l]);
+         delete K[l];
 
          K[l] = S;
       }
@@ -851,16 +899,14 @@ void DGAdvectionApp::InitLevel(int l)
    {
       if (myid == 0) cout << "\nWriting the mass and advection matrices, M and K, for"
               " level 0.\n" << endl;
-      // M[l]->Print("drive-05-M");
-      // K[l]->Print("drive-05-K");
-      string filename = "M_nt" + to_string(options.num_time_steps);
+      string filename = "M_prob" + to_string(options.problem) + "_size" + to_string(options.par_ref_levels);
       M[l]->Print(filename.c_str());
-      filename = "K_nt" + to_string(options.num_time_steps);
+      filename = "K_prob" + to_string(options.problem) + "_size" + to_string(options.par_ref_levels);
       K[l]->Print(filename.c_str());
    }
 
    // Create the time-dependent operator, ode[l]
-   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], *B[l], options);
+   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], m, k, B[l], b, source, ess_dof_list, options);
 
    fe_ev->SetPreconditionerType(options.prec_type);
    ode[l] = fe_ev;
@@ -914,27 +960,69 @@ void DGAdvectionApp::PrintStats(MPI_Comm comm)
 
 void DGAdvectionApp::PlotMode()
 {
+   int myid;
+   MPI_Comm_rank(MPI_COMM_WORLD, &myid);
+   if (myid == 0)
+   {
+      char filename[256];
+      sprintf(filename,"slowMode_size%d_k%d_solver%d.0", options.par_ref_levels, options.cfactor, options.ode_solver_type);
+      printf(filename);
+      HYPRE_ParVector readHypreVector = hypre_ParVectorRead(mesh[0]->GetComm(), filename);
 
+      HypreParVector mfemHypreVector(readHypreVector);
 
-   HYPRE_ParVector readHypreVector = hypre_ParVectorRead(mesh[0]->GetComm(), "slowMode_nt500");
+      ParGridFunction plotGridFunction(fe_space[0], mfemHypreVector);
 
-   HypreParVector mfemHypreVector(readHypreVector);
+      // Save the mesh and the solution in parallel. This output can
+      // be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
+      std::ostringstream mesh_name, sol_name;
+      mesh_name << "modeMesh_size" << options.par_ref_levels << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+      sol_name << "slowMode_size" << options.par_ref_levels << "_k" << options.cfactor << "_solver" << options.ode_solver_type << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
 
-   ParGridFunction plotGridFunction(fe_space[0], mfemHypreVector);
+      std::ofstream mesh_ofs(mesh_name.str().c_str());
+      mesh_ofs.precision(8);
+      mesh[0]->Print(mesh_ofs);
 
-   // Save the mesh and the solution in parallel. This output can
-   // be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
-   std::ostringstream mesh_name, sol_name;
-   mesh_name << "modeMesh." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
-   sol_name << "slowMode." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+      std::ofstream sol_ofs(sol_name.str().c_str());
+      sol_ofs.precision(8);
+      plotGridFunction.Save(sol_ofs);
+   }
+}
 
-   std::ofstream mesh_ofs(mesh_name.str().c_str());
-   mesh_ofs.precision(8);
-   mesh[0]->Print(mesh_ofs);
+// Initial condition
+double source_function(Vector &x, double t)
+{
+   int dim = x.Size();
 
-   std::ofstream sol_ofs(sol_name.str().c_str());
-   sol_ofs.precision(8);
-   plotGridFunction.Save(sol_ofs);
+   // map to the reference [-1,1] domain
+   Vector X(dim);
+   for (int i = 0; i < dim; i++)
+   {
+      double center = (bb_min[i] + bb_max[i]) * 0.5;
+      X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
+   }
+   double T = t/100.0;
+
+   switch (problem)
+   {
+      case 0:
+      {
+         switch (dim)
+         {
+            double r;
+            case 1:
+               r = min(abs(X(0) - sin(2.0*M_PI*T)), 1.0);
+               return exp(-1.0/(1.0 - r*r));
+            case 2:
+               r = min(sqrt( (X(0) - sin(2.0*M_PI*T))*(X(0) - sin(2.0*M_PI*T)) + (X(1) - cos(2.0*M_PI*T))*(X(1) - cos(2.0*M_PI*T)) ), 1.0);
+               return exp(-1.0/(1.0 - r*r));
+            case 3:
+               r = min(sqrt( (X(0) - sin(2.0*M_PI*T))*(X(0) - sin(2.0*M_PI*T)) + (X(1) - cos(2.0*M_PI*T))*(X(1) - cos(2.0*M_PI*T)) + (X(2) - cos(2.0*M_PI*T))*(X(2) - cos(2.0*M_PI*T)) ), 1.0);
+               return exp(-1.0/(1.0 - r*r));
+         }
+      }
+   }
+   return 0.0;
 }
 
 // Velocity coefficient
