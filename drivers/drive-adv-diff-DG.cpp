@@ -393,6 +393,8 @@ int FE_Evolution::GetDtIndex(double dt) const
 void FE_Evolution::Mult(const Vector &x, Vector &y) 
 {
   // Setup time-dependent source term if needed
+  source.SetTime(this->GetTime());
+  b_form->Assemble();
   if (options.dirichlet_bcs)
   {
     FunctionCoefficient u0(u0_function);
@@ -400,14 +402,12 @@ void FE_Evolution::Mult(const Vector &x, Vector &y)
     u->ProjectCoefficient(u0);
     Array<int> ess_bdr(b_form->ParFESpace()->GetParMesh()->bdr_attributes.Max());
     ess_bdr = 1;
-    source.SetTime(this->GetTime());
-    b_form->Assemble();
     k_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
     m_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
-    delete b;
     delete u;
-    b = b_form->ParallelAssemble();
   }
+  delete b;
+  b = b_form->ParallelAssemble();
 
    // y = M^{-1} (K x + b)
    K.Mult(x, z);
@@ -419,6 +419,8 @@ void FE_Evolution::ImplicitSolve(const double dt, const Vector &x, Vector &k)
 {
 
   // Setup time-dependent source term if needed
+  source.SetTime(this->GetTime());
+  b_form->Assemble();
   if (options.dirichlet_bcs)
   {
     FunctionCoefficient u0(u0_function);
@@ -426,14 +428,12 @@ void FE_Evolution::ImplicitSolve(const double dt, const Vector &x, Vector &k)
     u->ProjectCoefficient(u0);
     Array<int> ess_bdr(b_form->ParFESpace()->GetParMesh()->bdr_attributes.Max());
     ess_bdr = 1;
-    source.SetTime(this->GetTime());
-    b_form->Assemble();
     k_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
     m_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
-    delete b;
     delete u;
-    b = b_form->ParallelAssemble();
   }
+  delete b;
+  b = b_form->ParallelAssemble();
 
    // k = (M - dt*K)^{-1} (K x + b)
    int i = GetDtIndex(dt);
@@ -1001,7 +1001,6 @@ double source_function(Vector &x, double t)
       double center = (bb_min[i] + bb_max[i]) * 0.5;
       X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
    }
-   double T = t/100.0;
 
    switch (problem)
    {
@@ -1011,13 +1010,13 @@ double source_function(Vector &x, double t)
          {
             double r;
             case 1:
-               r = min(abs(X(0) - sin(2.0*M_PI*T)), 1.0);
+               r = min(abs(X(0) - sin(t)), 1.0);
                return exp(-1.0/(1.0 - r*r));
             case 2:
-               r = min(sqrt( (X(0) - sin(2.0*M_PI*T))*(X(0) - sin(2.0*M_PI*T)) + (X(1) - cos(2.0*M_PI*T))*(X(1) - cos(2.0*M_PI*T)) ), 1.0);
+               r = min(sqrt( (X(0) - sin(t))*(X(0) - sin(t)) + (X(1) - cos(t))*(X(1) - cos(t)) ), 1.0);
                return exp(-1.0/(1.0 - r*r));
             case 3:
-               r = min(sqrt( (X(0) - sin(2.0*M_PI*T))*(X(0) - sin(2.0*M_PI*T)) + (X(1) - cos(2.0*M_PI*T))*(X(1) - cos(2.0*M_PI*T)) + (X(2) - cos(2.0*M_PI*T))*(X(2) - cos(2.0*M_PI*T)) ), 1.0);
+               r = min(sqrt( (X(0) - sin(t))*(X(0) - sin(t)) + (X(1) - cos(t))*(X(1) - cos(t)) + (X(2) - cos(t))*(X(2) - cos(t)) ), 1.0);
                return exp(-1.0/(1.0 - r*r));
          }
       }
