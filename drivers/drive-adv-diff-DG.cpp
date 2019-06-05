@@ -99,11 +99,7 @@ class FE_Evolution : public TimeDependentOperator
 private:
    DGAdvectionOptions &options;
    HypreParMatrix &M, &K;
-   ParBilinearForm *m_form, *k_form;
-   FunctionCoefficient &source;
-   Array<int> &ess_dof_list;
-   ParLinearForm *b_form;
-   HypreParVector *b;
+   HypreParVector **b;
    HypreSmoother M_prec;
    CGSolver M_solver;
 
@@ -120,13 +116,12 @@ private:
    int GetDtIndex(double dt) const;
 
 public:
-   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, ParBilinearForm *_m_form, ParBilinearForm *_k_form,
-                           HypreParVector *_b, ParLinearForm *_b_form, FunctionCoefficient &_source, Array<int> &_ess_dof_list, DGAdvectionOptions &_options);
+   FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, HypreParVector **_b, DGAdvectionOptions &_options);
 
    /** 0 - HypreParaSails, 1 - HypreBoomerAMG, 2 - UMFPackSolver */
    void SetPreconditionerType(int type) { prec_type = type; }
 
-   virtual void Mult(const Vector &x, Vector &y);
+   virtual void Mult(const Vector &x, Vector &y) const;
 
    /** Solve the equation: k = f(x + dt*k, t), for the unknown k.
        For this class the equation becomes:
@@ -150,8 +145,6 @@ protected:
    DG_FECollection dg_fe_coll;
    H1_FECollection h1_fe_coll;
 
-   Array<int> ess_dof_list;
-
    FunctionCoefficient source;
    VectorFunctionCoefficient velocity;
    FunctionCoefficient inflow;
@@ -163,9 +156,9 @@ protected:
    Array<HypreParMatrix *> K; // advection matrices
    Array<HypreParVector *> B; // r.h.s. vectors
 
-   ParBilinearForm *m;
-   ParBilinearForm *k;
-   ParLinearForm *b;
+   Array<ParBilinearForm *> m;
+   Array<ParBilinearForm *> k;
+   Array<ParLinearForm *> b;
 
    int Step_calls_counter, Norm_calls_counter;
 
@@ -301,10 +294,9 @@ int main(int argc, char *argv[])
 
 
 // Implementation of class FE_Evolution
-FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, ParBilinearForm *_m_form, ParBilinearForm *_k_form,
-                           HypreParVector *_b, ParLinearForm *_b_form, FunctionCoefficient &_source, Array<int> &_ess_dof_list, DGAdvectionOptions &_options)
+FE_Evolution::FE_Evolution(HypreParMatrix &_M, HypreParMatrix &_K, HypreParVector **_b, DGAdvectionOptions &_options)
    : TimeDependentOperator(_M.Height()),
-     options(_options), M(_M), K(_K), m_form(_m_form), k_form(_k_form), source(_source), ess_dof_list(_ess_dof_list), b_form(_b_form),b(_b), M_solver(M.GetComm()), z(_M.Height())
+     options(_options), M(_M), K(_K), b(_b), M_solver(M.GetComm()), z(_M.Height())
 {
    M_prec.SetType(HypreSmoother::Jacobi);
    M_solver.SetPreconditioner(M_prec);
@@ -390,55 +382,20 @@ int FE_Evolution::GetDtIndex(double dt) const
    return dts.Size()-1;
 }
 
-void FE_Evolution::Mult(const Vector &x, Vector &y) 
+void FE_Evolution::Mult(const Vector &x, Vector &y) const
 {
-  // Setup time-dependent source term if needed
-  source.SetTime(this->GetTime());
-  b_form->Assemble();
-  if (options.dirichlet_bcs)
-  {
-    FunctionCoefficient u0(u0_function);
-    ParGridFunction *u = new ParGridFunction(b_form->ParFESpace());
-    u->ProjectCoefficient(u0);
-    Array<int> ess_bdr(b_form->ParFESpace()->GetParMesh()->bdr_attributes.Max());
-    ess_bdr = 1;
-    k_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
-    m_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
-    delete u;
-  }
-  delete b;
-  b = b_form->ParallelAssemble();
-
    // y = M^{-1} (K x + b)
    K.Mult(x, z);
-   z += *b;
+   z += **b;
    M_solver.Mult(z, y);
 }
 
 void FE_Evolution::ImplicitSolve(const double dt, const Vector &x, Vector &k)
 {
-
-  // Setup time-dependent source term if needed
-  source.SetTime(this->GetTime());
-  b_form->Assemble();
-  if (options.dirichlet_bcs)
-  {
-    FunctionCoefficient u0(u0_function);
-    ParGridFunction *u = new ParGridFunction(b_form->ParFESpace());
-    u->ProjectCoefficient(u0);
-    Array<int> ess_bdr(b_form->ParFESpace()->GetParMesh()->bdr_attributes.Max());
-    ess_bdr = 1;
-    k_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
-    m_form->EliminateEssentialBC(ess_bdr, *u, *b_form);
-    delete u;
-  }
-  delete b;
-  b = b_form->ParallelAssemble();
-
    // k = (M - dt*K)^{-1} (K x + b)
    int i = GetDtIndex(dt);
    K.Mult(x, z);
-   z += *b;
+   z += **b;
 
    if (options.problem == 0)
    {
@@ -608,8 +565,8 @@ DGAdvectionApp::~DGAdvectionApp()
       delete B[l];
       delete K[l];
       delete M[l];
-      delete m;
-      delete k;
+      delete m[l];
+      delete k[l];
    }
 }
 
@@ -629,11 +586,29 @@ int DGAdvectionApp::Step(braid_Vector    u_,
    int level = u->level;
    double tstart, tstop, dt;
    int braid_level, iter;
-   
+
    pstatus.GetTstartTstop(&tstart, &tstop);
    pstatus.GetLevel(&braid_level);
    pstatus.GetIter(&iter);
    dt = tstop - tstart;
+
+  // Setup time-dependent source term if needed
+  // !!! Is this right? I think for implicit, we should set b at time = t + dt, explicit at time = t (does it really matter?? just need to solve something...)
+  if (options.ode_solver_type < 10) source.SetTime(tstart);
+  else source.SetTime(tstart+dt);
+  b[level]->Assemble();
+  if (options.dirichlet_bcs)
+  {
+    ParGridFunction *u = new ParGridFunction(fe_space[level]);
+    u->ProjectCoefficient(u0);
+    Array<int> ess_bdr(mesh[level]->bdr_attributes.Max());
+    ess_bdr = 1;
+    k[level]->EliminateEssentialBC(ess_bdr, *u, *(b[level]));
+    m[level]->EliminateEssentialBC(ess_bdr, *u, *(b[level]));
+    delete u;
+  }
+  delete B[level];
+  B[level] =  b[level]->ParallelAssemble();
 
    Step_calls_counter++;
    // Keep this for debugging:
@@ -749,6 +724,9 @@ void DGAdvectionApp::AllocLevels(int num_levels)
    M.SetSize(num_levels, NULL);
    K.SetSize(num_levels, NULL);
    B.SetSize(num_levels, NULL);
+   m.SetSize(num_levels, NULL);
+   k.SetSize(num_levels, NULL);
+   b.SetSize(num_levels, NULL);
 }
 
 // Construct the ParFiniteElmentSpace for the given mesh. Used by
@@ -771,27 +749,27 @@ void DGAdvectionApp::InitLevel(int l)
    // the mass matrix, M; the advection (+diffusion) matrix, K; and the inflow
    // b.c. vector, B.
    const int skip_zeros = 0;
-   m = new ParBilinearForm(fe_space[l]);
+   m[l] = new ParBilinearForm(fe_space[l]);
    if (!options.lump_mass)
-      m->AddDomainIntegrator(new MassIntegrator);
+      m[l]->AddDomainIntegrator(new MassIntegrator);
    else
-      m->AddDomainIntegrator(new LumpedIntegrator(new MassIntegrator));
+      m[l]->AddDomainIntegrator(new LumpedIntegrator(new MassIntegrator));
 
-   b = new ParLinearForm(fe_space[l]);
+   b[l] = new ParLinearForm(fe_space[l]);
 
    if (options.problem == 0)
    {
-      b->AddDomainIntegrator(new DomainLFIntegrator(source));
-      b->Assemble();
+      b[l]->AddDomainIntegrator(new DomainLFIntegrator(source));
+      b[l]->Assemble();
 
       // Diffusion operator
-      k = new ParBilinearForm(fe_space[l]);
+      k[l] = new ParBilinearForm(fe_space[l]);
       ConstantCoefficient diff_coef(-options.diffusion);
-      k->AddDomainIntegrator(new DiffusionIntegrator(diff_coef));
-      k->Assemble();
+      k[l]->AddDomainIntegrator(new DiffusionIntegrator(diff_coef));
+      k[l]->Assemble();
 
       // Assmeble mass matrix and rhs vector
-      m->Assemble();
+      m[l]->Assemble();
 
       // Set Dirichlet BCs if requested
       if (options.dirichlet_bcs)
@@ -800,27 +778,25 @@ void DGAdvectionApp::InitLevel(int l)
          ess_bdr = 1;
          ParGridFunction *u = new ParGridFunction(fe_space[l]);
          u->ProjectCoefficient(u0);
-         k->EliminateEssentialBC(ess_bdr, *u, *b);
-         m->EliminateEssentialBC(ess_bdr, *u, *b);
-         fe_space[l]->GetEssentialTrueDofs(ess_bdr, ess_dof_list);
+         k[l]->EliminateEssentialBC(ess_bdr, *u, *(b[l]));
+         m[l]->EliminateEssentialBC(ess_bdr, *u, *(b[l]));
          delete u;
       }
-      
 
       // Finalize and assemble matrices
-      k->Finalize();
-      m->Finalize();
-      K[l] = k->ParallelAssemble();
-      M[l] = m->ParallelAssemble();
-      B[l] = b->ParallelAssemble();
+      k[l]->Finalize();
+      m[l]->Finalize();
+      K[l] = k[l]->ParallelAssemble();
+      M[l] = m[l]->ParallelAssemble();
+      B[l] = b[l]->ParallelAssemble();
    }
    else
    {
-      k = new ParBilinearForm(fe_space[l]);
-      k->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
-      k->AddInteriorFaceIntegrator(
+      k[l] = new ParBilinearForm(fe_space[l]);
+      k[l]->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
+      k[l]->AddInteriorFaceIntegrator(
          new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
-      k->AddBdrFaceIntegrator(
+      k[l]->AddBdrFaceIntegrator(
          new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
 
       double sigma, kappa;
@@ -870,18 +846,18 @@ void DGAdvectionApp::InitLevel(int l)
          }
       }
 
-      ParLinearForm *b = new ParLinearForm(fe_space[l]);
-      b->AddBdrFaceIntegrator( new BoundaryFlowIntegrator(inflow, velocity, -1.0, -0.5));
+      b[l] = new ParLinearForm(fe_space[l]);
+      b[l]->AddBdrFaceIntegrator( new BoundaryFlowIntegrator(inflow, velocity, -1.0, -0.5));
       
-      m->Assemble();
-      m->Finalize();
-      k->Assemble(skip_zeros);
-      k->Finalize(skip_zeros);
-      b->Assemble();
+      m[l]->Assemble();
+      m[l]->Finalize();
+      k[l]->Assemble(skip_zeros);
+      k[l]->Finalize(skip_zeros);
+      b[l]->Assemble();
 
-      M[l] = m->ParallelAssemble();
-      K[l] = k->ParallelAssemble();
-      B[l] = b->ParallelAssemble();
+      M[l] = m[l]->ParallelAssemble();
+      K[l] = k[l]->ParallelAssemble();
+      B[l] = b[l]->ParallelAssemble();
 
       if (S)
       {
@@ -906,13 +882,14 @@ void DGAdvectionApp::InitLevel(int l)
    }
 
    // Create the time-dependent operator, ode[l]
-   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], m, k, B[l], b, source, ess_dof_list, options);
+   FE_Evolution *fe_ev = new FE_Evolution(*M[l], *K[l], &(B[l]), options);
 
    fe_ev->SetPreconditionerType(options.prec_type);
    ode[l] = fe_ev;
 
    // Setup the ODE solver, solver[l]
    ODESolver *ode_solver = NULL;
+   ARKODESolver *arkode = NULL;
    switch (options.ode_solver_type)
    {
       case 1: ode_solver = new ForwardEulerSolver; break;
@@ -925,9 +902,20 @@ void DGAdvectionApp::InitLevel(int l)
       case 12: ode_solver = new SDIRK23Solver(2); break;
       case 13: ode_solver = new SDIRK33Solver; break;
 
+      case 21:
+      {
+        const double reltol = 1e-2, abstol = 1e-2;
+        arkode = new ARKODESolver(ARKODESolver::EXPLICIT); 
+        arkode->SetSStolerances(reltol, abstol);
+        arkode->SetMaxStep( options.cfactor * (options.t_final - options.t_start) / options.num_time_steps );
+        arkode->SetERKTableNum(FEHLBERG_13_7_8);
+        break;
+      }
+
       default: ode_solver = new RK4Solver; break;
    }
-   solver[l] = ode_solver;
+   if (ode_solver) solver[l] = ode_solver;
+   else if (arkode) solver[l] = arkode;
 
    // Associate the ODE operator, ode[l], with the ODE solver, solver[l]
    solver[l]->Init(*ode[l]);
