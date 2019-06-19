@@ -64,6 +64,7 @@ struct DGAdvectionOptions : public BraidOptions
 {
    bool   plot_mode;
    int    problem;
+   int    n_x;
    double diffusion;
    int    order;
    int    ode_solver_type;
@@ -229,8 +230,8 @@ int main(int argc, char *argv[])
    Mesh *mesh = opts.LoadMeshAndSerialRefine();
    if (!mesh)
    {
-      if (!strcmp(opts.mesh_file,"square")) mesh = new Mesh(2, 2, Element::QUADRILATERAL);
-      else if (!strcmp(opts.mesh_file,"cube")) mesh = new Mesh(2, 2, 2, Element::QUADRILATERAL);
+      if (!strcmp(opts.mesh_file,"square")) mesh = new Mesh(opts.n_x, opts.n_x, Element::QUADRILATERAL);
+      else if (!strcmp(opts.mesh_file,"cube")) mesh = new Mesh(opts.n_x, opts.n_x, opts.n_x, Element::QUADRILATERAL);
       // if (myid == 0)
       // {
       //    cerr << "\nError loading mesh file: " << opts.mesh_file
@@ -278,7 +279,7 @@ int main(int argc, char *argv[])
       braid_Real *rnorms = (braid_Real*) calloc(num_rnorm, sizeof(braid_Real));
       core.GetRNorms(&num_rnorm, rnorms);
       ofstream outfile;
-      outfile.open("res_size" + to_string(opts.par_ref_levels) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
+      outfile.open("res_prob" + to_string(opts.problem) + "_size" + to_string(opts.n_x) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
       outfile << rnorms[0] << " " << 1.0 << endl;
       for (auto i = 0; i < num_rnorm-1; i++)
       {
@@ -433,11 +434,12 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    t_final        = 10.0;
    num_time_steps = 1000;
    num_procs_x    = 1;
+   n_x            = 2;
 
    // set defaults for the (optional) mesh/refinement inherited options
    mesh_file       = "/home/nfs/wmitchell/Documents/mfem/data/periodic-square.mesh";
    // mesh_file       = "square";
-   ser_ref_levels  = 2;
+   ser_ref_levels  = 0;
    par_ref_levels  = 0;
    AddMeshOptions();
 
@@ -500,6 +502,8 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
              "Set the GLVis host.");
    AddOption(&visport, "-vp", "--visualization-port",
              "Set the GLVis port.");
+   AddOption(&n_x, "-nx", "--nx",
+             "Set number of elements in the x direction.");
    AddOption(&vis_time_steps, "-vts", "--visualize-time-steps",
              "Visualize every n-th time step (0:final only).");
    AddOption(&vis_braid_steps, "-vbs", "--visualize-braid-steps",
@@ -516,7 +520,11 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
 
    Parse();
 
-   if (problem == 0 && diffusion == 0.0) diffusion = 1.0;
+   if (problem == 0) diffusion = 1.0;
+   if (problem % 10 == 1) diffusion = 1.0;
+   if (problem % 10 == 2) diffusion = 0.1;
+   if (problem % 10 == 3) diffusion = 0.01;
+   if (problem % 10 == 4) diffusion = 0.001;
 
    dt = (t_final - t_start) / num_time_steps;
 }
@@ -592,23 +600,23 @@ int DGAdvectionApp::Step(braid_Vector    u_,
    pstatus.GetIter(&iter);
    dt = tstop - tstart;
 
-  // Setup time-dependent source term if needed
-  // !!! Is this right? I think for implicit, we should set b at time = t + dt, explicit at time = t (does it really matter?? just need to solve something...)
-  if (options.ode_solver_type < 10) source.SetTime(tstart);
-  else source.SetTime(tstart+dt);
-  b[level]->Assemble();
-  if (options.dirichlet_bcs)
-  {
-    ParGridFunction *u = new ParGridFunction(fe_space[level]);
-    u->ProjectCoefficient(u0);
-    Array<int> ess_bdr(mesh[level]->bdr_attributes.Max());
-    ess_bdr = 1;
-    k[level]->EliminateEssentialBC(ess_bdr, *u, *(b[level]));
-    m[level]->EliminateEssentialBC(ess_bdr, *u, *(b[level]));
-    delete u;
-  }
-  delete B[level];
-  B[level] =  b[level]->ParallelAssemble();
+   // Setup time-dependent source term if needed
+   // !!! Is this right? I think for implicit, we should set b at time = t + dt, explicit at time = t (does it really matter?? just need to solve something...)
+   if (options.ode_solver_type < 10) source.SetTime(tstart);
+   else source.SetTime(tstart+dt);
+   b[level]->Assemble();
+   if (options.dirichlet_bcs)
+   {
+      ParGridFunction *u = new ParGridFunction(fe_space[level]);
+      u->ProjectCoefficient(u0);
+      Array<int> ess_bdr(mesh[level]->bdr_attributes.Max());
+      ess_bdr = 1;
+      k[level]->EliminateEssentialBC(ess_bdr, *u, *(b[level]));
+      m[level]->EliminateEssentialBC(ess_bdr, *u, *(b[level]));
+      delete u;
+   }
+   delete B[level];
+   B[level] =  b[level]->ParallelAssemble();
 
    Step_calls_counter++;
    // Keep this for debugging:
@@ -794,90 +802,50 @@ void DGAdvectionApp::InitLevel(int l)
    {
       k[l] = new ParBilinearForm(fe_space[l]);
       k[l]->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
-      k[l]->AddInteriorFaceIntegrator(
-         new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
-      k[l]->AddBdrFaceIntegrator(
-         new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
-
+      k[l]->AddInteriorFaceIntegrator( new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
+      k[l]->AddBdrFaceIntegrator( new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
+      ConstantCoefficient diff_coef(-options.diffusion);
       double sigma, kappa;
       sigma = -1.0;
       kappa = (options.order+1)*(options.order+1);
-
-      HypreParMatrix *S = NULL;
-      if (options.diffusion > 0.0)
-      {
-
-         ParBilinearForm *s = new ParBilinearForm(fe_space[l]);
-
-         // S has coefficient one, we multiply by the "diffusion" coefficient,
-         // options.diffusion, later.
-         ConstantCoefficient one(1.0);
-         s->AddDomainIntegrator(new DiffusionIntegrator(one));
-         s->AddInteriorFaceIntegrator(
-            new DGDiffusionIntegrator(one, sigma, kappa));
-         // s->AddBdrFaceIntegrator(new DGDiffusionIntegrator(one, sigma, kappa));
-         s->Assemble(skip_zeros);
-         s->Finalize(skip_zeros);
-         S = s->ParallelAssemble();
-         delete s;
-         if (options.diss_oper_type)
-         {
-            // S := S M^{-1} S
-            // a) assemble M^{-1}
-            HypreParMatrix *Mi;
-            {
-               ParBilinearForm mi(fe_space[l]);
-               if (!options.lump_mass)
-                  mi.AddDomainIntegrator(
-                     new InverseIntegrator(new MassIntegrator));
-               else
-                  mi.AddDomainIntegrator(
-                     new InverseIntegrator(
-                        new LumpedIntegrator(new MassIntegrator)));
-               mi.Assemble();
-               mi.Finalize();
-               Mi = mi.ParallelAssemble();
-            }
-            HypreParMatrix *MiS = mfem::ParMult(Mi, S);
-            delete Mi;
-            HypreParMatrix *SMiS = mfem::ParMult(S, MiS);
-            delete S;
-            S = SMiS;
-         }
-      }
+      k[l]->AddDomainIntegrator(new DiffusionIntegrator(diff_coef));
+      k[l]->AddInteriorFaceIntegrator( new DGDiffusionIntegrator(diff_coef, sigma, kappa));
+      k[l]->Assemble(skip_zeros);
 
       b[l] = new ParLinearForm(fe_space[l]);
+      b[l]->AddDomainIntegrator(new DomainLFIntegrator(source));
       b[l]->AddBdrFaceIntegrator( new BoundaryFlowIntegrator(inflow, velocity, -1.0, -0.5));
       
       m[l]->Assemble();
+
+      if (options.dirichlet_bcs)
+      {
+        ParGridFunction *u = new ParGridFunction(fe_space[l]);
+        u->ProjectCoefficient(u0);
+        Array<int> ess_bdr(mesh[l]->bdr_attributes.Max());
+        ess_bdr = 1;        
+        k[l]->EliminateEssentialBC(ess_bdr, *u, *(b[l]));
+        m[l]->EliminateEssentialBC(ess_bdr, *u, *(b[l]));
+
+        delete u;
+      }
+
       m[l]->Finalize();
-      k[l]->Assemble(skip_zeros);
       k[l]->Finalize(skip_zeros);
       b[l]->Assemble();
 
       M[l] = m[l]->ParallelAssemble();
       K[l] = k[l]->ParallelAssemble();
       B[l] = b[l]->ParallelAssemble();
-
-      if (S)
-      {
-         // K[l] := K[l] - diff*S
-         *S *= (-options.diffusion);
-
-         hypre_ParCSRMatrixSum(*S, 1.0, *K[l]);
-         delete K[l];
-
-         K[l] = S;
-      }
    }
 
    if (l == 0 && options.write_matrices)
    {
       if (myid == 0) cout << "\nWriting the mass and advection matrices, M and K, for"
               " level 0.\n" << endl;
-      string filename = "M_prob" + to_string(options.problem) + "_size" + to_string(options.par_ref_levels);
+      string filename = "M_prob" + to_string(options.problem) + "_size" + to_string(options.n_x);
       M[l]->Print(filename.c_str());
-      filename = "K_prob" + to_string(options.problem) + "_size" + to_string(options.par_ref_levels);
+      filename = "K_prob" + to_string(options.problem) + "_size" + to_string(options.n_x);
       K[l]->Print(filename.c_str());
    }
 
@@ -905,10 +873,10 @@ void DGAdvectionApp::InitLevel(int l)
       case 21:
       {
         const double reltol = 1e-2, abstol = 1e-2;
-        arkode = new ARKODESolver(ARKODESolver::EXPLICIT); 
-        arkode->SetSStolerances(reltol, abstol);
-        arkode->SetMaxStep( options.cfactor * (options.t_final - options.t_start) / options.num_time_steps );
-        arkode->SetERKTableNum(FEHLBERG_13_7_8);
+        arkode = new ARKODESolver(ARKODESolver::IMPLICIT); 
+        arkode->SetSStolerances(reltol, abstol); // What should these be???
+        arkode->SetMaxStep( options.cfactor * (options.t_final - options.t_start) / options.num_time_steps ); // Is this right???
+        arkode->SetERKTableNum(SDIRK_2_1_2);
         break;
       }
 
@@ -953,7 +921,7 @@ void DGAdvectionApp::PlotMode()
    if (myid == 0)
    {
       char filename[256];
-      sprintf(filename,"slowMode_size%d_k%d_solver%d.0", options.par_ref_levels, options.cfactor, options.ode_solver_type);
+      sprintf(filename,"slowMode_size%d_k%d_solver%d.0", options.n_x, options.cfactor, options.ode_solver_type);
       printf(filename);
       HYPRE_ParVector readHypreVector = hypre_ParVectorRead(mesh[0]->GetComm(), filename);
 
@@ -964,8 +932,8 @@ void DGAdvectionApp::PlotMode()
       // Save the mesh and the solution in parallel. This output can
       // be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
       std::ostringstream mesh_name, sol_name;
-      mesh_name << "modeMesh_size" << options.par_ref_levels << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
-      sol_name << "slowMode_size" << options.par_ref_levels << "_k" << options.cfactor << "_solver" << options.ode_solver_type << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+      mesh_name << "modeMesh_size" << options.n_x << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+      sol_name << "slowMode_size" << options.n_x << "_k" << options.cfactor << "_solver" << options.ode_solver_type << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
 
       std::ofstream mesh_ofs(mesh_name.str().c_str());
       mesh_ofs.precision(8);
@@ -990,25 +958,29 @@ double source_function(Vector &x, double t)
       X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
    }
 
-   switch (problem)
+   if (problem == 0)
    {
-      case 0:
+      switch (dim)
       {
-         switch (dim)
-         {
-            double r;
-            case 1:
-               r = min(abs(X(0) - sin(t)), 1.0);
-               return exp(-1.0/(1.0 - r*r));
-            case 2:
-               r = min(sqrt( (X(0) - sin(t))*(X(0) - sin(t)) + (X(1) - cos(t))*(X(1) - cos(t)) ), 1.0);
-               return exp(-1.0/(1.0 - r*r));
-            case 3:
-               r = min(sqrt( (X(0) - sin(t))*(X(0) - sin(t)) + (X(1) - cos(t))*(X(1) - cos(t)) + (X(2) - cos(t))*(X(2) - cos(t)) ), 1.0);
-               return exp(-1.0/(1.0 - r*r));
-         }
+         double r;
+         case 1:
+            r = min(abs(X(0) - sin(t)), 1.0);
+            return exp(-1.0/(1.0 - r*r));
+         case 2:
+            r = min(sqrt( (X(0) - sin(t))*(X(0) - sin(t)) + (X(1) - cos(t))*(X(1) - cos(t)) ), 1.0);
+            return exp(-1.0/(1.0 - r*r));
+         case 3:
+            r = min(sqrt( (X(0) - sin(t))*(X(0) - sin(t)) + (X(1) - cos(t))*(X(1) - cos(t)) + (X(2) - cos(t))*(X(2) - cos(t)) ), 1.0);
+            return exp(-1.0/(1.0 - r*r));
       }
    }
+   else
+   {
+      if (X(0) < -0.25 && X(0) > -0.75 && X(1) < -0.25 && X(1) > -0.75) return sin(t)*sin(t);
+      else return 0.0;
+
+   }
+
    return 0.0;
 }
 
@@ -1025,57 +997,50 @@ void velocity_function(const Vector &x, Vector &v)
       X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
    }
 
-   switch (problem)
-   {
-      case 0:
-      {
-         // Zero
-         switch (dim)
-         {
-            case 1: v(0) = 0.0; break;
-            case 2: v(0) = 0.0; v(1) = 0.0; break;
-            case 3: v(0) = 0.0; v(1) = 0.0; v(2) = 0.0;
-               break;
-         }
-         break;
-      }
-      case 1:
-         // Translations in 1D, 2D, and 3D
-         switch (dim)
-         {
-            case 1: v(0) = 1.0; break;
-            case 2: v(0) = sqrt(2./3.); v(1) = sqrt(1./3.); break;
-            case 3: v(0) = sqrt(3./6.); v(1) = sqrt(2./6.); v(2) = sqrt(1./6.);
-               break;
-         }
-         break;
-      case 2:
-      {
-         // Clockwise rotation in 2D around the origin
-         const double w = M_PI/2;
-         switch (dim)
-         {
-            case 1: v(0) = 1.0; break;
-            case 2: v(0) = w*X(1); v(1) = -w*X(0); break;
-            case 3: v(0) = w*X(1); v(1) = -w*X(0); v(2) = 0.0; break;
-         }
-         break;
-      }
-      case 3:
-      {
-         // Clockwise twisting rotation in 2D around the origin
-         const double w = M_PI/2;
-         double d = max((X(0)+1.)*(1.-X(0)),0.) * max((X(1)+1.)*(1.-X(1)),0.);
-         d = d*d;
-         switch (dim)
-         {
-            case 1: v(0) = 1.0; break;
-            case 2: v(0) = d*w*X(1); v(1) = -d*w*X(0); break;
-            case 3: v(0) = d*w*X(1); v(1) = -d*w*X(0); v(2) = 0.0; break;
-         }
-         break;
-      }
-   }
+    if (problem == 0)
+    {
+       // Zero
+       switch (dim)
+       {
+          case 1: v(0) = 0.0; break;
+          case 2: v(0) = 0.0; v(1) = 0.0; break;
+          case 3: v(0) = 0.0; v(1) = 0.0; v(2) = 0.0; break;
+       }
+    }
+    else if (problem < 10)
+    {
+       // Translations in 1D, 2D, and 3D
+       switch (dim)
+       {
+          case 1: v(0) = 1.0; break;
+          case 2: v(0) = sqrt(2./3.); v(1) = sqrt(1./3.); break;
+          case 3: v(0) = sqrt(3./6.); v(1) = sqrt(2./6.); v(2) = sqrt(1./6.); break;
+       }
+    }
+    else if (problem < 20)
+    {
+       // Clockwise rotation in 2D around the origin
+       const double w = M_PI/2;
+       switch (dim)
+       {
+          case 1: v(0) = 1.0; break;
+          case 2: v(0) = w*X(1); v(1) = -w*X(0); break;
+          case 3: v(0) = w*X(1); v(1) = -w*X(0); v(2) = 0.0; break;
+       }
+    }
+    else if (problem < 30)
+    {
+       // Clockwise twisting rotation in 2D around the origin
+       const double w = M_PI/2;
+       double d = max((X(0)+1.)*(1.-X(0)),0.) * max((X(1)+1.)*(1.-X(1)),0.);
+       d = d*d;
+       switch (dim)
+       {
+          case 1: v(0) = 1.0; break;
+          case 2: v(0) = d*w*X(1); v(1) = -d*w*X(0); break;
+          case 3: v(0) = d*w*X(1); v(1) = -d*w*X(0); v(2) = 0.0; break;
+       }
+    }
 }
 
 // Initial condition
@@ -1091,54 +1056,52 @@ double u0_function(Vector &x)
       X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
    }
 
-   switch (problem)
-   {
-      case 0:
-      {
-         switch (dim)
-         {
-            case 1:
-               return (X(0) - 1.0)*(X(0) + 1.0);
-            case 2:
-               return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0);
-            case 3:
-               return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0)*(X(2) - 1.0)*(X(2) + 1.0);
-         }
-      }
-      case 1:
-      {
-         switch (dim)
-         {
-            case 1:
-               return exp(-40.*pow(X(0)-0.5,2));
-            case 2:
-            case 3:
-            {
-               double rx = 0.45, ry = 0.25, cx = 0., cy = -0.2, w = 10.;
-               if (dim == 3)
-               {
-                  const double s = (1. + 0.25*cos(2*M_PI*X(2)));
-                  rx *= s;
-                  ry *= s;
-               }
-               return ( erfc(w*(X(0)-cx-rx))*erfc(-w*(X(0)-cx+rx)) *
-                        erfc(w*(X(1)-cy-ry))*erfc(-w*(X(1)-cy+ry)) )/16;
-            }
-         }
-      }
-      case 2:
-      {
-         double x_ = X(0), y_ = X(1), rho, phi;
-         rho = hypot(x_, y_);
-         phi = atan2(y_, x_);
-         return pow(sin(M_PI*rho),2)*sin(3*phi);
-      }
-      case 3:
-      {
-         const double f = M_PI;
-         return sin(f*X(0))*sin(f*X(1));
-      }
-   }
+    if (problem == 0)
+    {
+       switch (dim)
+       {
+          case 1:
+             return (X(0) - 1.0)*(X(0) + 1.0);
+          case 2:
+             return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0);
+          case 3:
+             return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0)*(X(2) - 1.0)*(X(2) + 1.0);
+       }
+    }
+    else if (problem < 10)
+    {
+       switch (dim)
+       {
+          case 1:
+             return exp(-40.*pow(X(0)-0.5,2));
+          case 2:
+          case 3:
+          {
+             double rx = 0.45, ry = 0.25, cx = 0., cy = -0.2, w = 10.;
+             if (dim == 3)
+             {
+                const double s = (1. + 0.25*cos(2*M_PI*X(2)));
+                rx *= s;
+                ry *= s;
+             }
+             return ( erfc(w*(X(0)-cx-rx))*erfc(-w*(X(0)-cx+rx)) *
+                      erfc(w*(X(1)-cy-ry))*erfc(-w*(X(1)-cy+ry)) )/16;
+          }
+       }
+    }
+    else if (problem < 20)
+    {
+       double x_ = X(0), y_ = X(1), rho, phi;
+       rho = hypot(x_, y_);
+       phi = atan2(y_, x_);
+       if (rho >= 1.0) return 0.0;
+       else return pow(sin(M_PI*rho),2)*sin(3*phi);
+    }
+    else if (problem < 30)
+    {
+       const double f = M_PI;
+       return sin(f*X(0))*sin(f*X(1));
+    }
    return 0.0;
 }
 
