@@ -47,6 +47,7 @@ using namespace hypre;
 // inflow boundary condition are chosen based on this parameter.
 int problem;
 Vector bb_min, bb_max;
+double t_final_global;
 
 // Source function
 double source_function(Vector &x, double t);
@@ -77,6 +78,7 @@ struct DGAdvectionOptions : public BraidOptions
    int    prec_type; // passed down to FE_Evolution
    int    diss_oper_type;
    bool   dirichlet_bcs;
+   int    spatial_solver;
 
    const char *vishost;
    int         visport;
@@ -200,6 +202,7 @@ int main(int argc, char *argv[])
 {
    MPI_Init(&argc, &argv);
 
+  {
    MPI_Comm comm = MPI_COMM_WORLD;
    int myid;
    MPI_Comm_rank(comm, &myid);
@@ -232,13 +235,16 @@ int main(int argc, char *argv[])
    {
       if (!strcmp(opts.mesh_file,"square")) mesh = new Mesh(opts.n_x, opts.n_x, Element::QUADRILATERAL);
       else if (!strcmp(opts.mesh_file,"cube")) mesh = new Mesh(opts.n_x, opts.n_x, opts.n_x, Element::QUADRILATERAL);
-      // if (myid == 0)
-      // {
-      //    cerr << "\nError loading mesh file: " << opts.mesh_file
-      //         << '\n' << endl;
-      // }
-      // MPI_Finalize();
-      // return 2;
+      else
+      {
+        if (myid == 0)
+        {
+           cerr << "\nError loading mesh file: " << opts.mesh_file
+                << '\n' << endl;
+        }
+        MPI_Finalize();
+        return 2;
+      }
    }
 
    // If the mesh is NURBS, convert it to curved mesh
@@ -288,6 +294,7 @@ int main(int argc, char *argv[])
       }
       outfile.close();
    }
+  }
 
    MPI_Finalize();
    return 0;
@@ -350,7 +357,7 @@ int FE_Evolution::GetDtIndex(double dt) const
    HypreBoomerAMG *AMG_solver = new HypreBoomerAMG(B_s_new);
    AMG_solver->SetMaxLevels(50);   
 
-   if (options.problem != 0) {
+   if (options.spatial_solver == 1) {
       AMG_solver->SetLAIROptions(1.5, "", "FFC", 0.1, 0.01, 0.0,
       100, 3, 0.0, 10, -1, 1);
       // 100, 3, 0.0, 6, -1, 1);
@@ -448,10 +455,8 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    problem         = 0;
    diffusion       = 0.0;
    diss_oper_type  = 0; // 0 - diffusion (S), 1 - diffusion squared (S^2)
-   // order           = 3;
-   
-   // !!! Debug: changing to continuous galerkin order 1
    order = 1;
+   spatial_solver = 0;
 
    ode_solver_type = 4;
    basis_type      = 0;
@@ -482,6 +487,8 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
              "ODE solver: 1 - Forward Euler, 2 - RK2 SSP, 3 - RK3 SSP,"
              " 4 - RK4, 6 - RK6,\n"
              "\t11 - Backward Euler, 12 - SDIRK-2, 13 - SDIRK-3");
+   AddOption(&spatial_solver, "-S", "--spatial-solver",
+             "spatial solver: 0 = default BoomerAMG, 1 = AIR BoomerAMG");
    AddOption(&basis_type, "-b", "--basis-type",
              "DG basis type: 0 - Nodal Gauss-Legendre, 1 - Nodal Gauss-Lobatto,"
              " 2 - Positive");
@@ -527,6 +534,7 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
    if (problem % 10 == 4) diffusion = 0.001;
 
    dt = (t_final - t_start) / num_time_steps;
+   t_final_global = t_final;
 }
 
 
@@ -605,7 +613,7 @@ int DGAdvectionApp::Step(braid_Vector    u_,
    if (options.ode_solver_type < 10) source.SetTime(tstart);
    else source.SetTime(tstart+dt);
    b[level]->Assemble();
-   if (options.dirichlet_bcs)
+   if (options.dirichlet_bcs && options.problem == 0)
    {
       ParGridFunction *u = new ParGridFunction(fe_space[level]);
       u->ProjectCoefficient(u0);
@@ -801,34 +809,33 @@ void DGAdvectionApp::InitLevel(int l)
    else
    {
       k[l] = new ParBilinearForm(fe_space[l]);
-      k[l]->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
-      k[l]->AddInteriorFaceIntegrator( new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
-      k[l]->AddBdrFaceIntegrator( new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
-      ConstantCoefficient diff_coef(-options.diffusion);
       double sigma, kappa;
       sigma = -1.0;
       kappa = (options.order+1)*(options.order+1);
-      k[l]->AddDomainIntegrator(new DiffusionIntegrator(diff_coef));
-      k[l]->AddInteriorFaceIntegrator( new DGDiffusionIntegrator(diff_coef, sigma, kappa));
+
+      // Diffusion part
+      ConstantCoefficient diff_coef(-options.diffusion);
+      if (options.diffusion != 0.0)
+      {
+        k[l]->AddDomainIntegrator(new DiffusionIntegrator(diff_coef));
+        k[l]->AddInteriorFaceIntegrator( new DGDiffusionIntegrator(diff_coef, sigma, kappa));
+        if (options.dirichlet_bcs) k[l]->AddBdrFaceIntegrator(new DGDiffusionIntegrator(diff_coef, sigma, kappa));
+      }
+      
+      // Advection part
+      k[l]->AddDomainIntegrator(new ConvectionIntegrator(velocity, -1.0));
+      k[l]->AddInteriorFaceIntegrator( new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
+      k[l]->AddBdrFaceIntegrator( new TransposeIntegrator(new DGTraceIntegrator(velocity, 1.0, -0.5)));
+
       k[l]->Assemble(skip_zeros);
 
+      // RHS
       b[l] = new ParLinearForm(fe_space[l]);
       b[l]->AddDomainIntegrator(new DomainLFIntegrator(source));
+      if (options.dirichlet_bcs) b[l]->AddBdrFaceIntegrator( new DGDirichletLFIntegrator(u0, source, sigma, kappa));
       b[l]->AddBdrFaceIntegrator( new BoundaryFlowIntegrator(inflow, velocity, -1.0, -0.5));
-      
+
       m[l]->Assemble();
-
-      if (options.dirichlet_bcs)
-      {
-        ParGridFunction *u = new ParGridFunction(fe_space[l]);
-        u->ProjectCoefficient(u0);
-        Array<int> ess_bdr(mesh[l]->bdr_attributes.Max());
-        ess_bdr = 1;        
-        k[l]->EliminateEssentialBC(ess_bdr, *u, *(b[l]));
-        m[l]->EliminateEssentialBC(ess_bdr, *u, *(b[l]));
-
-        delete u;
-      }
 
       m[l]->Finalize();
       k[l]->Finalize(skip_zeros);
@@ -857,7 +864,7 @@ void DGAdvectionApp::InitLevel(int l)
 
    // Setup the ODE solver, solver[l]
    ODESolver *ode_solver = NULL;
-   ARKODESolver *arkode = NULL;
+   // ARKODESolver *arkode = NULL;
    switch (options.ode_solver_type)
    {
       case 1: ode_solver = new ForwardEulerSolver; break;
@@ -870,20 +877,20 @@ void DGAdvectionApp::InitLevel(int l)
       case 12: ode_solver = new SDIRK23Solver(2); break;
       case 13: ode_solver = new SDIRK33Solver; break;
 
-      case 21:
-      {
-        const double reltol = 1e-2, abstol = 1e-2;
-        arkode = new ARKODESolver(ARKODESolver::IMPLICIT); 
-        arkode->SetSStolerances(reltol, abstol); // What should these be???
-        arkode->SetMaxStep( options.cfactor * (options.t_final - options.t_start) / options.num_time_steps ); // Is this right???
-        arkode->SetERKTableNum(SDIRK_2_1_2);
-        break;
-      }
+      // case 21:
+      // {
+      //   const double reltol = 1e-2, abstol = 1e-2;
+      //   arkode = new ARKODESolver(ARKODESolver::IMPLICIT); 
+      //   arkode->SetSStolerances(reltol, abstol); // What should these be???
+      //   arkode->SetMaxStep( options.cfactor * (options.t_final - options.t_start) / options.num_time_steps ); // Is this right???
+      //   arkode->SetERKTableNum(SDIRK_2_1_2);
+      //   break;
+      // }
 
       default: ode_solver = new RK4Solver; break;
    }
    if (ode_solver) solver[l] = ode_solver;
-   else if (arkode) solver[l] = arkode;
+   // else if (arkode) solver[l] = arkode;
 
    // Associate the ODE operator, ode[l], with the ODE solver, solver[l]
    solver[l]->Init(*ode[l]);
@@ -958,7 +965,8 @@ double source_function(Vector &x, double t)
       X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
    }
 
-   if (problem == 0)
+   // if (problem == 0)
+   if (0)
    {
       switch (dim)
       {
@@ -976,7 +984,10 @@ double source_function(Vector &x, double t)
    }
    else
    {
-      if (X(0) < -0.25 && X(0) > -0.75 && X(1) < -0.25 && X(1) > -0.75) return sin(t)*sin(t);
+      double T = 2.0 * M_PI * t / t_final_global;
+      if (X(0) < -0.25 && X(0) > -0.75 && X(1) < -0.25 && X(1) > -0.75) return cos(T)*cos(T);
+      // else if (X(0) < 0.75 && X(0) > 0.25 && X(1) < -0.25 && X(1) > -0.75) return cos(T)*cos(T);
+      // else if (X(0) < -0.25 && X(0) > -0.75 && X(1) < 0.75 && X(1) > 0.25) return cos(T)*cos(T);
       else return 0.0;
 
    }
@@ -1013,6 +1024,7 @@ void velocity_function(const Vector &x, Vector &v)
        switch (dim)
        {
           case 1: v(0) = 1.0; break;
+          // case 2: v(0) = 1.0; v(1) = 0.0; break;
           case 2: v(0) = sqrt(2./3.); v(1) = sqrt(1./3.); break;
           case 3: v(0) = sqrt(3./6.); v(1) = sqrt(2./6.); v(2) = sqrt(1./6.); break;
        }
@@ -1030,78 +1042,84 @@ void velocity_function(const Vector &x, Vector &v)
     }
     else if (problem < 30)
     {
-       // Clockwise twisting rotation in 2D around the origin
-       const double w = M_PI/2;
-       double d = max((X(0)+1.)*(1.-X(0)),0.) * max((X(1)+1.)*(1.-X(1)),0.);
-       d = d*d;
-       switch (dim)
-       {
-          case 1: v(0) = 1.0; break;
-          case 2: v(0) = d*w*X(1); v(1) = -d*w*X(0); break;
-          case 3: v(0) = d*w*X(1); v(1) = -d*w*X(0); v(2) = 0.0; break;
-       }
+       // // Clockwise twisting rotation in 2D around the origin
+       // const double w = M_PI/2;
+       // double d = max((X(0)+1.)*(1.-X(0)),0.) * max((X(1)+1.)*(1.-X(1)),0.);
+       // d = d*d;
+       // switch (dim)
+       // {
+       //    case 1: v(0) = 1.0; break;
+       //    case 2: v(0) = d*w*X(1); v(1) = -d*w*X(0); break;
+       //    case 3: v(0) = d*w*X(1); v(1) = -d*w*X(0); v(2) = 0.0; break;
+       // }
+      switch (dim)
+      {
+        case 1: v(0) = cos(M_PI*x(0))*cos(M_PI*x(0)); break;
+        case 2: v(0) = max(cos(M_PI*x(1))*cos(M_PI*x(1)), 0.001); v(1) = max(cos(M_PI*x(0))*cos(M_PI*x(0)), 0.001); break;
+        case 3: v(0) = cos(M_PI*x(1))*cos(M_PI*x(1)); v(1) = cos(M_PI*x(2))*cos(M_PI*x(2)); v(2) = cos(M_PI*x(0))*cos(M_PI*x(0)); break;
+      }
     }
 }
 
 // Initial condition
 double u0_function(Vector &x)
 {
-   int dim = x.Size();
+   // int dim = x.Size();
 
-   // map to the reference [-1,1] domain
-   Vector X(dim);
-   for (int i = 0; i < dim; i++)
-   {
-      double center = (bb_min[i] + bb_max[i]) * 0.5;
-      X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
-   }
+   // // map to the reference [-1,1] domain
+   // Vector X(dim);
+   // for (int i = 0; i < dim; i++)
+   // {
+   //    double center = (bb_min[i] + bb_max[i]) * 0.5;
+   //    X(i) = 2 * (x(i) - center) / (bb_max[i] - bb_min[i]);
+   // }
 
-    if (problem == 0)
-    {
-       switch (dim)
-       {
-          case 1:
-             return (X(0) - 1.0)*(X(0) + 1.0);
-          case 2:
-             return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0);
-          case 3:
-             return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0)*(X(2) - 1.0)*(X(2) + 1.0);
-       }
-    }
-    else if (problem < 10)
-    {
-       switch (dim)
-       {
-          case 1:
-             return exp(-40.*pow(X(0)-0.5,2));
-          case 2:
-          case 3:
-          {
-             double rx = 0.45, ry = 0.25, cx = 0., cy = -0.2, w = 10.;
-             if (dim == 3)
-             {
-                const double s = (1. + 0.25*cos(2*M_PI*X(2)));
-                rx *= s;
-                ry *= s;
-             }
-             return ( erfc(w*(X(0)-cx-rx))*erfc(-w*(X(0)-cx+rx)) *
-                      erfc(w*(X(1)-cy-ry))*erfc(-w*(X(1)-cy+ry)) )/16;
-          }
-       }
-    }
-    else if (problem < 20)
-    {
-       double x_ = X(0), y_ = X(1), rho, phi;
-       rho = hypot(x_, y_);
-       phi = atan2(y_, x_);
-       if (rho >= 1.0) return 0.0;
-       else return pow(sin(M_PI*rho),2)*sin(3*phi);
-    }
-    else if (problem < 30)
-    {
-       const double f = M_PI;
-       return sin(f*X(0))*sin(f*X(1));
-    }
+   // if (problem == 0)
+   // {
+   //    switch (dim)
+   //    {
+   //       case 1:
+   //          return (X(0) - 1.0)*(X(0) + 1.0);
+   //       case 2:
+   //          return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0);
+   //       case 3:
+   //          return (X(0) - 1.0)*(X(0) + 1.0)*(X(1) - 1.0)*(X(1) + 1.0)*(X(2) - 1.0)*(X(2) + 1.0);
+   //    }
+   // }
+   // else if (problem < 10)
+   // {
+   //    switch (dim)
+   //    {
+   //       case 1:
+   //          return exp(-40.*pow(X(0)-0.5,2));
+   //       case 2:
+   //       case 3:
+   //       {
+   //          double rx = 0.45, ry = 0.25, cx = 0., cy = -0.2, w = 10.;
+   //          if (dim == 3)
+   //          {
+   //             const double s = (1. + 0.25*cos(2*M_PI*X(2)));
+   //             rx *= s;
+   //             ry *= s;
+   //          }
+   //          return ( erfc(w*(X(0)-cx-rx))*erfc(-w*(X(0)-cx+rx)) *
+   //                   erfc(w*(X(1)-cy-ry))*erfc(-w*(X(1)-cy+ry)) )/16;
+   //       }
+   //    }
+   // }
+   // else if (problem < 20)
+   // {
+   //    double x_ = X(0), y_ = X(1), rho, phi;
+   //    rho = hypot(x_, y_);
+   //    phi = atan2(y_, x_);
+   //    if (rho >= 1.0) return 0.0;
+   //    else return pow(sin(M_PI*rho),2)*sin(3*phi);
+   // }
+   // else if (problem < 30)
+   // {
+   //    const double f = M_PI;
+   //    return sin(f*X(0))*sin(f*X(1));
+   // }
    return 0.0;
 }
 
