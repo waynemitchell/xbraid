@@ -77,7 +77,7 @@ all: $(C_NOHYPRE) $(C_EXAMPLES) $(CXX_EXAMPLES)
 # Rule for compiling .cpp files; links with mfem
 %: %.cpp $(BRAID_LIB_FILE) $(MFEM_LIB_FILE) $(MFEM_CONFIG_MK) $(MFEM_INTERFACE)
 	@echo "Building" $@ "..."
-	$(MPICXX) $(CXXFLAGS) $(BRAID_FLAGS) $(MFEM_FLAGS) \
+	$(MPICXX) $(CXXFLAGS) -g $(BRAID_FLAGS) $(MFEM_FLAGS) \
  $< -o $@ $(MFEM_LIBS) $(BRAID_LIB_FILE) $(LFLAGS) $(PARMETIS_LIB)
 
 # Generate an error message if the MFEM library is not built and exit
