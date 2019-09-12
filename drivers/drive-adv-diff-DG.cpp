@@ -144,7 +144,6 @@ class DGAdvectionApp : public MFEMBraidApp
 protected:
    DGAdvectionOptions &options;
 
-   // !!! Debug: switching to continuous Galerkin
    DG_FECollection dg_fe_coll;
    H1_FECollection h1_fe_coll;
 
@@ -343,12 +342,12 @@ int FE_Evolution::GetDtIndex(double dt) const
    }
    // cout << "\nConstructing (M - dt K) and solver for dt = " << dt << endl;
    dts.Append(dt);
-   B.Append(new HypreParMatrix(hypre_ParCSRMatrixAdd(M, K)));
-   HypreParMatrix &B_new = *B.Last();
-   hypre_ParCSRMatrixSetConstantValues(B_new, 0.0);
-   hypre_ParCSRMatrixSum(B_new, 1.0, M);
-   hypre_ParCSRMatrixSum(B_new, -dt, K);
+   
+   hypre_ParCSRMatrix *new_mat;
+   hypre_ParcsrAdd( 1.0, M, -dt, K, &new_mat );
+   B.Append(new HypreParMatrix(new_mat));
 
+   HypreParMatrix &B_new = *B.Last();
    B_s.Append(new HypreParMatrix(B_new));
    HypreParMatrix &B_s_new = *B_s.Last();
    if (options.problem != 0) BlockInvScal(&B_new, &B_s_new, NULL, NULL, blocksize, 0);

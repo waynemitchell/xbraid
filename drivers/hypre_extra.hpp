@@ -87,78 +87,146 @@ namespace hypre
     * matrices use the same row and column partitions and the same col_map_offd
     * arrays.
     * -----------------------------------------------------------------------*/
-   hypre_ParCSRMatrix *
-   hypre_ParCSRMatrixAdd( hypre_ParCSRMatrix *A,
-                          hypre_ParCSRMatrix *B )
-   {
-      MPI_Comm            comm   = hypre_ParCSRMatrixComm(A);
-      hypre_CSRMatrix    *A_diag = hypre_ParCSRMatrixDiag(A);
-      hypre_CSRMatrix    *A_offd = hypre_ParCSRMatrixOffd(A);
-      HYPRE_Int          *A_cmap = hypre_ParCSRMatrixColMapOffd(A);
-      HYPRE_Int           A_cmap_size = hypre_CSRMatrixNumCols(A_offd);
-      hypre_CSRMatrix    *B_diag = hypre_ParCSRMatrixDiag(B);
-      hypre_CSRMatrix    *B_offd = hypre_ParCSRMatrixOffd(B);
-      HYPRE_Int          *B_cmap = hypre_ParCSRMatrixColMapOffd(B);
-      HYPRE_Int           B_cmap_size = hypre_CSRMatrixNumCols(B_offd);
-      hypre_ParCSRMatrix *C;
-      hypre_CSRMatrix    *C_diag;
-      hypre_CSRMatrix    *C_offd;
-      HYPRE_Int          *C_cmap;
-      HYPRE_Int           im;
 
-      /* Make sure A_cmap and B_cmap are the same. */
-      if (A_cmap_size != B_cmap_size)
-      {
-         hypre_printf("Warning! hypre_ParCSRMatrixAdd: cmap_size!\n");
-         return NULL;
-      }
+hypre_ParCSRMatrix *
+hypre_ParCSRMatrixAdd(hypre_ParCSRMatrix *A,
+                      hypre_ParCSRMatrix *B)
+{
+   MPI_Comm            comm   = hypre_ParCSRMatrixComm(A);
+   hypre_CSRMatrix    *A_diag = hypre_ParCSRMatrixDiag(A);
+   hypre_CSRMatrix    *A_offd = hypre_ParCSRMatrixOffd(A);
+   HYPRE_Int          *A_cmap = hypre_ParCSRMatrixColMapOffd(A);
+   HYPRE_Int           A_cmap_size = hypre_CSRMatrixNumCols(A_offd);
+   hypre_CSRMatrix    *B_diag = hypre_ParCSRMatrixDiag(B);
+   hypre_CSRMatrix    *B_offd = hypre_ParCSRMatrixOffd(B);
+   HYPRE_Int          *B_cmap = hypre_ParCSRMatrixColMapOffd(B);
+   HYPRE_Int           B_cmap_size = hypre_CSRMatrixNumCols(B_offd);
+   hypre_ParCSRMatrix *C;
+   hypre_CSRMatrix    *C_diag;
+   hypre_CSRMatrix    *C_offd;
+   HYPRE_Int          *C_cmap;
+   HYPRE_Int           im;
+   HYPRE_Int           cmap_differ;
+
+   /* Check if A_cmap and B_cmap are the same. */
+   cmap_differ = 0;
+   if (A_cmap_size != B_cmap_size)
+   {
+      cmap_differ = 1; /* A and B have different cmap_size */
+   }
+   else
+   {
       for (im = 0; im < A_cmap_size; im++)
       {
          if (A_cmap[im] != B_cmap[im])
          {
-            hypre_printf("Warning! hypre_ParCSRMatrixAdd: cmap!\n");
-            return NULL;
+            cmap_differ = 1; /* A and B have different cmap arrays */
+            break;
          }
       }
+   }
+
+   if ( cmap_differ == 0 )
+   {
+      /* A and B have the same column mapping for their off-diagonal blocks so
+         we can sum the diagonal and off-diagonal blocks separately and reduce
+         temporary memory usage. */
 
       /* Add diagonals, off-diagonals, copy cmap. */
       C_diag = hypre_CSRMatrixAdd(A_diag, B_diag);
+      if (!C_diag)
+      {
+         return NULL; /* error: A_diag and B_diag have different dimensions */
+      }
       C_offd = hypre_CSRMatrixAdd(A_offd, B_offd);
-      C_cmap = _braid_TAlloc(HYPRE_Int, A_cmap_size);
+      if (!C_offd)
+      {
+         hypre_CSRMatrixDestroy(C_diag);
+         return NULL; /* error: A_offd and B_offd have different dimensions */
+      }
+      /* copy A_cmap -> C_cmap */
+      C_cmap = hypre_TAlloc(HYPRE_Int, A_cmap_size, HYPRE_MEMORY_HOST);
       for (im = 0; im < A_cmap_size; im++)
+      {
          C_cmap[im] = A_cmap[im];
+      }
 
-      C = hypre_ParCSRMatrixCreate( comm,
-                                    hypre_ParCSRMatrixGlobalNumRows(A),
-                                    hypre_ParCSRMatrixGlobalNumCols(A),
-                                    hypre_ParCSRMatrixRowStarts(A),
-                                    hypre_ParCSRMatrixColStarts(A),
-                                    hypre_CSRMatrixNumCols(C_offd),
-                                    hypre_CSRMatrixNumNonzeros(C_diag),
-                                    hypre_CSRMatrixNumNonzeros(C_offd) );
+      C = hypre_ParCSRMatrixCreate(comm,
+                                   hypre_ParCSRMatrixGlobalNumRows(A),
+                                   hypre_ParCSRMatrixGlobalNumCols(A),
+                                   hypre_ParCSRMatrixRowStarts(A),
+                                   hypre_ParCSRMatrixColStarts(A),
+                                   hypre_CSRMatrixNumCols(C_offd),
+                                   hypre_CSRMatrixNumNonzeros(C_diag),
+                                   hypre_CSRMatrixNumNonzeros(C_offd));
 
       /* In C, destroy diag/offd (allocated by Create) and replace them with
-         C_diag/C_offd. */
+      C_diag/C_offd. */
       hypre_CSRMatrixDestroy(hypre_ParCSRMatrixDiag(C));
       hypre_CSRMatrixDestroy(hypre_ParCSRMatrixOffd(C));
       hypre_ParCSRMatrixDiag(C) = C_diag;
       hypre_ParCSRMatrixOffd(C) = C_offd;
 
       hypre_ParCSRMatrixColMapOffd(C) = C_cmap;
-
-      /* hypre_ParCSRMatrixSetNumNonzeros(A); */
-
-      /* Make sure that the first entry in each row is the diagonal one. */
-      hypre_CSRMatrixReorder(hypre_ParCSRMatrixDiag(C));
-
-      /* C owns diag, offd, and cmap. */
-      hypre_ParCSRMatrixSetDataOwner(C, 1);
-      /* C does not own row and column starts. */
-      hypre_ParCSRMatrixSetRowStartsOwner(C, 0);
-      hypre_ParCSRMatrixSetColStartsOwner(C, 0);
-
-      return C;
    }
+   else
+   {
+      /* A and B have different column mappings for their off-diagonal blocks so
+      we need to use the column maps to create full-width CSR matricies. */
+
+      int  ierr = 0;
+      hypre_CSRMatrix * csr_A;
+      hypre_CSRMatrix * csr_B;
+      hypre_CSRMatrix * csr_C_temp;
+
+      /* merge diag and off-diag portions of A */
+      csr_A = hypre_MergeDiagAndOffd(A);
+
+      /* merge diag and off-diag portions of B */
+      csr_B = hypre_MergeDiagAndOffd(B);
+
+      /* add A and B */
+      csr_C_temp = hypre_CSRMatrixAdd(csr_A,csr_B);
+
+      /* delete CSR versions of A and B */
+      ierr += hypre_CSRMatrixDestroy(csr_A);
+      ierr += hypre_CSRMatrixDestroy(csr_B);
+
+      /* create a new empty ParCSR matrix to contain the sum */
+      C = hypre_ParCSRMatrixCreate(hypre_ParCSRMatrixComm(A),
+                                   hypre_ParCSRMatrixGlobalNumRows(A),
+                                   hypre_ParCSRMatrixGlobalNumCols(A),
+                                   hypre_ParCSRMatrixRowStarts(A),
+                                   hypre_ParCSRMatrixColStarts(A),
+                                   0, 0, 0);
+
+      /* split C into diag and off-diag portions */
+      /* TODO: GenerateDiagAndOffd() uses an int array of size equal to the
+         number of columns in csr_C_temp which is the global number of columns
+         in A and B. This does not scale well. */
+      ierr += GenerateDiagAndOffd(csr_C_temp, C,
+                                  hypre_ParCSRMatrixFirstColDiag(A),
+                                  hypre_ParCSRMatrixLastColDiag(A));
+
+      /* delete CSR version of C */
+      ierr += hypre_CSRMatrixDestroy(csr_C_temp);
+
+      MFEM_VERIFY(ierr == 0, "");
+   }
+
+   /* hypre_ParCSRMatrixSetNumNonzeros(A); */
+
+   /* Make sure that the first entry in each row is the diagonal one. */
+   hypre_CSRMatrixReorder(hypre_ParCSRMatrixDiag(C));
+
+   /* C owns diag, offd, and cmap. */
+   hypre_ParCSRMatrixSetDataOwner(C, 1);
+   /* C does not own row and column starts. */
+   hypre_ParCSRMatrixSetRowStartsOwner(C, 0);
+   hypre_ParCSRMatrixSetColStartsOwner(C, 0);
+
+   return C;
+}
 
    /**------------------------------------------------------------------------
     * Perform the operation A += beta*B, assuming that both matrices use the
