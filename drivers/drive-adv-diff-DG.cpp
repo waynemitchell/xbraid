@@ -284,7 +284,9 @@ int main(int argc, char *argv[])
       braid_Real *rnorms = (braid_Real*) calloc(num_rnorm, sizeof(braid_Real));
       core.GetRNorms(&num_rnorm, rnorms);
       ofstream outfile;
-      outfile.open("res_prob" + to_string(opts.problem) + "_size" + to_string(opts.n_x) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + ".txt");
+      int cycle = 0; // 0 = 2-lvl, 1 = V-cycle, 2 = F-cycle
+      if (opts.max_levels != 2) cycle = opts.nfmg_Vcyc + 1;
+      outfile.open("res_prob" + to_string(opts.problem) + "_size" + to_string(opts.n_x) + "_k" + to_string(opts.cfactor) + "_solver" + to_string(opts.ode_solver_type) + "_cycle" + to_string(cycle) + ".txt");
       outfile << rnorms[0] << " " << 1.0 << endl;
       for (auto i = 0; i < num_rnorm-1; i++)
       {
@@ -526,11 +528,11 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
 
    Parse();
 
-   if (problem == 0) diffusion = 1.0;
-   if (problem % 10 == 1) diffusion = 1.0;
-   if (problem % 10 == 2) diffusion = 0.1;
-   if (problem % 10 == 3) diffusion = 0.01;
-   if (problem % 10 == 4) diffusion = 0.001;
+   if (problem == 0) diffusion = 1.0 / n_x;
+   if (problem % 10 == 1) diffusion = 1.0 / n_x;
+   if (problem % 10 == 2) diffusion = 0.1 / n_x;
+   if (problem % 10 == 3) diffusion = 0.01 / n_x;
+   if (problem % 10 == 4) diffusion = 0.001 / n_x;
 
    dt = (t_final - t_start) / num_time_steps;
    t_final_global = t_final;
