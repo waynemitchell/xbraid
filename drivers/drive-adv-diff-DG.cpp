@@ -528,11 +528,13 @@ DGAdvectionOptions::DGAdvectionOptions(int argc, char *argv[])
 
    Parse();
 
-   if (problem == 0) diffusion = 1.0 / n_x;
-   if (problem % 10 == 1) diffusion = 1.0 / n_x;
-   if (problem % 10 == 2) diffusion = 0.1 / n_x;
-   if (problem % 10 == 3) diffusion = 0.01 / n_x;
-   if (problem % 10 == 4) diffusion = 0.001 / n_x;
+   // double scaling = 10.0;
+   double scaling = n_x;
+   if (problem == 0) diffusion = 1.0 / scaling;
+   if (problem % 10 == 1) diffusion = 10.0 / scaling;
+   if (problem % 10 == 2) diffusion = 1.0 / scaling;
+   if (problem % 10 == 3) diffusion = 0.1 / scaling;
+   if (problem % 10 == 4) diffusion = 0.01 / scaling;
 
    dt = (t_final - t_start) / num_time_steps;
    t_final_global = t_final;
@@ -929,7 +931,7 @@ void DGAdvectionApp::PlotMode()
    if (myid == 0)
    {
       char filename[256];
-      sprintf(filename,"slowMode_size%d_k%d_solver%d.0", options.n_x, options.cfactor, options.ode_solver_type);
+      sprintf(filename,"slowMode_prob%d_size%d_k%d_solver%d.0", options.problem, options.n_x, options.cfactor, options.ode_solver_type);
       printf(filename);
       HYPRE_ParVector readHypreVector = hypre_ParVectorRead(mesh[0]->GetComm(), filename);
 
@@ -940,8 +942,8 @@ void DGAdvectionApp::PlotMode()
       // Save the mesh and the solution in parallel. This output can
       // be viewed later using GLVis: "glvis -np <np> -m mesh -g sol".
       std::ostringstream mesh_name, sol_name;
-      mesh_name << "modeMesh_size" << options.n_x << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
-      sol_name << "slowMode_size" << options.n_x << "_k" << options.cfactor << "_solver" << options.ode_solver_type << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+      mesh_name << "modeMesh_prob" << options.problem << "_size" << options.n_x << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
+      sol_name << "slowMode_prob" << options.problem << "_size" << options.n_x << "_k" << options.cfactor << "_solver" << options.ode_solver_type << "." << std::setfill('0') << std::setw(6) << mesh[0]->GetMyRank();
 
       std::ofstream mesh_ofs(mesh_name.str().c_str());
       mesh_ofs.precision(8);
